@@ -18,9 +18,13 @@
 //
 // /events and /notifications validate a krateo JWT the same way snowplow does
 // (HS256 against the shared JWT_SIGN_KEY secret) when that secret is set; see
-// auth.go. The only external dependency is the krateo plumbing JWT helper
+// auth.go. With RBAC_SCOPING_ENABLED=true both endpoints additionally enforce
+// server-side multi-tenant scoping: the caller's authorized-namespace set is
+// derived from Kubernetes RBAC (SubjectAccessReview) and injected as a
+// mandatory filter into the ClickHouse query and the SSE fan-out; see rbac.go.
+// The only external dependency is the krateo plumbing JWT helper
 // (github.com/krateoplatformops/plumbing) plus its golang-jwt transitive; the
-// ClickHouse polling + SSE hub remain pure standard library.
+// ClickHouse polling + SSE hub + K8s API client remain pure standard library.
 package main
 
 import (
@@ -129,6 +133,10 @@ func (row chRow) toSSEK8sEvent() SSEK8sEvent {
 type sseMessage struct {
 	topic string
 	data  []byte
+	// namespace is the K8s namespace of the involved object (empty for
+	// cluster-scoped events). The hub uses it to enforce per-client RBAC
+	// namespace scoping at fan-out time (see rbac.go).
+	namespace string
 }
 
 type client struct {
@@ -140,11 +148,20 @@ type client struct {
 	// messages broadcast under that exact topic (server-side per-composition
 	// subscription).
 	topic string
+	// scope is the caller's RBAC-derived namespace scope, resolved at connect
+	// time (nil = scoping disabled). Enforced server-side on every message so
+	// a direct connection can never stream another tenant's events.
+	scope *nsScope
 }
 
-// wants reports whether this client should receive a message on the given topic.
-func (c *client) wants(topic string) bool {
-	return c.topic == "" || c.topic == topic
+// wants reports whether this client should receive the message: the topic must
+// match the subscription AND the event's namespace must be within the caller's
+// RBAC-derived scope.
+func (c *client) wants(msg sseMessage) bool {
+	if c.topic != "" && c.topic != msg.topic {
+		return false
+	}
+	return c.scope.allows(msg.namespace)
 }
 
 type hub struct {
@@ -173,7 +190,7 @@ func (h *hub) broadcast(msg sseMessage) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for c := range h.clients {
-		if !c.wants(msg.topic) {
+		if !c.wants(msg) {
 			continue
 		}
 		// Non-blocking send: drop the message for slow clients rather than blocking.
@@ -310,14 +327,15 @@ func (p *poller) poll(ctx context.Context) {
 		}
 
 		// Global topic — mirrors eventsse behaviour where all events
-		// are published under the "krateo" topic.
-		p.hub.broadcast(sseMessage{topic: "krateo", data: data})
+		// are published under the "krateo" topic. The event's namespace rides
+		// along so the hub can enforce per-client RBAC scoping at fan-out.
+		p.hub.broadcast(sseMessage{topic: "krateo", data: data, namespace: row.ObjNamespace})
 		delivered++
 
 		// Composition-specific topic so per-composition listeners
 		// only receive their own events.
 		if row.CompositionID != "" {
-			p.hub.broadcast(sseMessage{topic: row.CompositionID, data: data})
+			p.hub.broadcast(sseMessage{topic: row.CompositionID, data: data, namespace: row.ObjNamespace})
 		}
 	}
 
@@ -424,6 +442,10 @@ const defaultEventsLimit = 200
 // with either an empty string or compositionIDFilter.
 const compositionPredicatePlaceholder = "/*COMPOSITION_PREDICATE*/"
 
+// namespacePredicatePlaceholder is replaced with either an empty string (no
+// scoping / cluster-wide caller) or namespaceFilter (RBAC-scoped caller).
+const namespacePredicatePlaceholder = "/*NAMESPACE_PREDICATE*/"
+
 // eventsSQLTemplate has one placeholder for the optional composition predicate.
 // The row limit is bound via the {limit:UInt32} ClickHouse query parameter.
 // (Single % in formatDateTime is correct: this string is NOT passed through
@@ -447,7 +469,7 @@ const eventsSQLTemplate = `SELECT
     ifNull(JSONExtractString(Body, 'object', 'source', 'component'), '')            AS source_component
 FROM otel_logs
 WHERE ResourceAttributes['telemetry.source'] = 'k8s-events'
-  AND JSONExtractString(Body, 'object', 'reason') != ''/*COMPOSITION_PREDICATE*/
+  AND JSONExtractString(Body, 'object', 'reason') != ''/*COMPOSITION_PREDICATE*//*NAMESPACE_PREDICATE*/
 ORDER BY Timestamp DESC
 LIMIT {limit:UInt32}
 FORMAT JSONEachRow`
@@ -459,6 +481,14 @@ FORMAT JSONEachRow`
 // pod-associated objects), so it is absent/wrong for top-level compositions
 // like user blueprints. The value is bound, not interpolated.
 const compositionIDFilter = "\n  AND JSONExtractString(Body, 'object', 'involvedObject', 'uid') = {composition_id:String}"
+
+// namespaceFilter is the predicate appended when the caller is RBAC-scoped to
+// a set of namespaces (see rbac.go). The set is bound as a ClickHouse
+// Array(String) parameter, never interpolated; every element is additionally
+// validated as an RFC 1123 label before serialization (defence in depth).
+// Cluster-scoped events (empty namespace) are excluded for scoped callers by
+// construction — ” is never in the allowed set.
+const namespaceFilter = "\n  AND JSONExtractString(Body, 'object', 'involvedObject', 'namespace') IN {namespaces:Array(String)}"
 
 // uuidRe matches an RFC 4122 UUID (the shape of a krateo composition id),
 // case-insensitively. Used to reject anything that is not a UUID before the
@@ -482,9 +512,12 @@ func parseLimit(raw string) int {
 }
 
 // buildEventsQuery returns the SQL and the bound ClickHouse parameters for the
-// given request query values. It returns an error only when composition_id is
-// present but not a valid UUID. limit is always clamped to a safe range.
-func buildEventsQuery(q url.Values) (string, map[string]string, error) {
+// given request query values and RBAC scope (nil scope or allowAll ⇒ no
+// namespace predicate). It returns an error when composition_id is present but
+// not a valid UUID, or when a scoped namespace is not a valid RFC 1123 label
+// (which cannot happen for names obtained from the K8s API — defence in
+// depth). limit is always clamped to a safe range.
+func buildEventsQuery(q url.Values, scope *nsScope) (string, map[string]string, error) {
 	params := map[string]string{
 		"limit": strconv.Itoa(parseLimit(q.Get("limit"))),
 	}
@@ -498,14 +531,59 @@ func buildEventsQuery(q url.Values) (string, map[string]string, error) {
 		params["composition_id"] = cid
 	}
 
+	nsPredicate := ""
+	if scope.restricted() {
+		arr, err := clickhouseArrayParam(scope.namespaces)
+		if err != nil {
+			return "", nil, err
+		}
+		nsPredicate = namespaceFilter
+		params["namespaces"] = arr
+	}
+
 	query := strings.Replace(eventsSQLTemplate, compositionPredicatePlaceholder, predicate, 1)
+	query = strings.Replace(query, namespacePredicatePlaceholder, nsPredicate, 1)
 	return query, params, nil
 }
 
-func handleEvents(cfg config, client *http.Client) http.HandlerFunc {
+// resolveRequestScope derives the caller's namespace scope from the verified
+// identity in the request context. A nil scoper (scoping disabled) yields a
+// nil scope (unrestricted). Errors mean the scope could NOT be established and
+// the caller must fail closed (startup guarantees auth is enabled whenever the
+// scoper is non-nil, so a missing identity here is a programming error, not a
+// reachable state).
+func resolveRequestScope(r *http.Request, scoper *rbacScoper) (*nsScope, error) {
+	if scoper == nil {
+		return nil, nil
+	}
+	ui, ok := userInfoFrom(r.Context())
+	if !ok {
+		return nil, fmt.Errorf("rbac scoping enabled but no verified identity on request")
+	}
+	return scoper.scopeFor(r.Context(), ui)
+}
+
+func handleEvents(cfg config, client *http.Client, scoper *rbacScoper) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		query, params, err := buildEventsQuery(r.URL.Query())
+
+		scope, err := resolveRequestScope(r, scoper)
+		if err != nil {
+			// Fail closed: no scope ⇒ no data.
+			slogErrorCtx(ctx, "events", "rbac scope resolution failed", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		if scope.restricted() && len(scope.namespaces) == 0 {
+			// Authenticated but authorized for no namespace: empty result,
+			// no ClickHouse round-trip.
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			fmt.Fprint(w, "[]")
+			return
+		}
+
+		query, params, err := buildEventsQuery(r.URL.Query(), scope)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -535,11 +613,22 @@ func handleEvents(cfg config, client *http.Client) http.HandlerFunc {
 // HTTP handlers
 // ---------------------------------------------------------------------------
 
-func handleSSE(h *hub) http.HandlerFunc {
+func handleSSE(h *hub, scoper *rbacScoper) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			http.Error(w, "streaming not supported", http.StatusInternalServerError)
+			return
+		}
+
+		// Resolve the caller's RBAC namespace scope BEFORE upgrading to a
+		// stream; fail closed when it cannot be established. The scope is
+		// fixed for the lifetime of the connection (RBAC changes apply on
+		// reconnect, within the scoper's cache TTL).
+		scope, err := resolveRequestScope(r, scoper)
+		if err != nil {
+			slogErrorCtx(r.Context(), "sse", "rbac scope resolution failed", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
 
@@ -556,7 +645,7 @@ func handleSSE(h *hub) http.HandlerFunc {
 		// name, the original behaviour.
 		topic := r.URL.Query().Get("composition_id")
 
-		c := &client{ch: make(chan sseMessage, 64), topic: topic}
+		c := &client{ch: make(chan sseMessage, 64), topic: topic, scope: scope}
 		h.register(c)
 		defer h.unregister(c)
 
@@ -598,6 +687,20 @@ func main() {
 	cfg := loadConfig()
 	auth := loadAuthConfig()
 	auth.logStatus()
+
+	// RBAC-derived multi-tenant scoping (see rbac.go). Misconfiguration is
+	// fatal — the proxy must never start half-scoped (fail closed).
+	scoper, err := loadRBACScoper()
+	if err != nil {
+		slogError("sse-proxy", "rbac scoping init failed", err)
+		os.Exit(1)
+	}
+	if scoper != nil && !auth.enabled() {
+		slogError("sse-proxy", "rbac scoping requires auth: set "+envJWTSignKey+" (scoping derives the filter from the verified caller identity)", nil)
+		os.Exit(1)
+	}
+	scoper.logStatus()
+
 	h := newHub()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -640,9 +743,9 @@ func main() {
 	// /events takes the JWT in the Authorization header (RESTAction forwards it);
 	// /notifications additionally accepts it via cookie/query param (EventSource
 	// cannot set headers). /health stays unauthenticated for k8s probes.
-	mux.HandleFunc("/events", auth.requireBearer(handleEvents(cfg, outboundClient)))
-	mux.HandleFunc("/notifications/", auth.requireSSEToken(handleSSE(h)))
-	mux.HandleFunc("/notifications", auth.requireSSEToken(handleSSE(h)))
+	mux.HandleFunc("/events", auth.requireBearer(handleEvents(cfg, outboundClient, scoper)))
+	mux.HandleFunc("/notifications/", auth.requireSSEToken(handleSSE(h, scoper)))
+	mux.HandleFunc("/notifications", auth.requireSSEToken(handleSSE(h, scoper)))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "ok")

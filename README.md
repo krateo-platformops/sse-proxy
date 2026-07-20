@@ -34,6 +34,27 @@ cannot set headers, `/notifications` also accepts the token via the `krateo-sess
 Auth is **opt-in**: when `JWT_SIGN_KEY` is unset the endpoints stay open (previous behaviour);
 set it to enforce validation. `/health` is always unauthenticated.
 
+## Multi-tenant scoping (server-side, RBAC-derived)
+
+With `RBAC_SCOPING_ENABLED=true` the proxy enforces **per-tenant namespace scoping at the query
+boundary** — the frontend is never trusted; a direct API call with a valid token still only sees
+what its Kubernetes RBAC allows:
+
+1. The caller's identity (username + groups) comes from the **verified** JWT.
+2. The proxy asks the local API server, via `SubjectAccessReview`, whether that subject can
+   `list events` (verb/resource configurable) **cluster-wide** — if yes, the caller is unscoped
+   (org/fleet admin).
+3. Otherwise it lists all namespaces and issues one SAR per namespace; the allowed set becomes a
+   mandatory filter, injected as a **bound** ClickHouse `Array(String)` parameter on `/events`
+   (`involvedObject.namespace IN {namespaces}`) and enforced per-message at SSE fan-out on
+   `/notifications`. An empty set ⇒ no data (**fail closed** — resolution errors also deny).
+
+Results are cached per (user, groups) for `RBAC_SCOPING_CACHE_TTL` (default 60s); SSE streams
+apply the scope resolved at connect time. Scoped callers never see cluster-scoped
+(namespace-less) events. Scoping **requires** auth: enabling it without `JWT_SIGN_KEY` is fatal
+at startup. The proxy's ServiceAccount needs `create subjectaccessreviews` + `list namespaces`
+(see `deploy/deployment.yaml`).
+
 ### Configuration (env)
 
 | Var | Default | Purpose |
@@ -43,6 +64,10 @@ set it to enforce validation. `/health` is always unauthenticated.
 | `LISTEN_ADDR` | `:8080` | listen address |
 | `JWT_SIGN_KEY` | empty (auth disabled) | shared HMAC secret; must match snowplow/authn |
 | `REFRESH_SESSION_COOKIE` | `krateo-session` | cookie name the SSE path reads the token from |
+| `RBAC_SCOPING_ENABLED` | `false` | enforce RBAC-derived namespace scoping (requires `JWT_SIGN_KEY`) |
+| `RBAC_SCOPING_VERB` / `RBAC_SCOPING_RESOURCE` / `RBAC_SCOPING_APIGROUP` | `list` / `events` / core | the RBAC rule that gates visibility |
+| `RBAC_SCOPING_CACHE_TTL` | `60s` | per-(user,groups) scope cache TTL |
+| `KUBERNETES_API_URL` | in-cluster | API endpoint override (tests/local runs) |
 
 ## Build & release
 Image: `ghcr.io/braghettos/krateo-sse-proxy`. Pushing a semver tag (`X.Y.Z`) builds and pushes

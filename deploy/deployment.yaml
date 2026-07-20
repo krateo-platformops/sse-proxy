@@ -1,4 +1,44 @@
 ---
+# ServiceAccount + RBAC for server-side multi-tenant scoping (rbac.go).
+# The proxy derives each caller's authorized-namespace set from Kubernetes RBAC
+# via SubjectAccessReview, so it needs to create SARs and enumerate namespaces.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: krateo-sse-proxy
+  namespace: krateo-system
+  labels:
+    app.kubernetes.io/name: krateo-sse-proxy
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: krateo-sse-proxy
+  labels:
+    app.kubernetes.io/name: krateo-sse-proxy
+rules:
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: krateo-sse-proxy
+  labels:
+    app.kubernetes.io/name: krateo-sse-proxy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: krateo-sse-proxy
+subjects:
+  - kind: ServiceAccount
+    name: krateo-sse-proxy
+    namespace: krateo-system
+---
 # Deployment for the Krateo SSE proxy.
 # Polls ClickHouse every 3 s and pushes new K8s events to connected browsers
 # via Server-Sent Events at /notifications/.
@@ -21,7 +61,7 @@ spec:
         app: krateo-sse-proxy
         app.kubernetes.io/name: krateo-sse-proxy
     spec:
-      serviceAccountName: default
+      serviceAccountName: krateo-sse-proxy
       containers:
         - name: sse-proxy
           # Built and pushed by .github/workflows/sse-proxy.yaml
@@ -44,6 +84,18 @@ spec:
                   optional: true
             - name: LISTEN_ADDR
               value: ":8080"
+            # JWT validation (shared HS256 secret with authn/snowplow) —
+            # REQUIRED when RBAC scoping is on (identity comes from the
+            # verified token; the proxy refuses to start scoped-but-unauthenticated).
+            - name: JWT_SIGN_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: jwt-sign-key
+                  key: JWT_SIGN_KEY
+            # Server-side multi-tenant scoping: filter events by the caller's
+            # RBAC-authorized namespaces (SubjectAccessReview-derived, fail-closed).
+            - name: RBAC_SCOPING_ENABLED
+              value: "true"
           livenessProbe:
             httpGet:
               path: /health
