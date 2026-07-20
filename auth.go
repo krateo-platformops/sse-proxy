@@ -18,6 +18,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -26,6 +27,29 @@ import (
 	"github.com/krateoplatformops/plumbing/http/response"
 	"github.com/krateoplatformops/plumbing/jwtutil"
 )
+
+// ---------------------------------------------------------------------------
+// Verified caller identity in the request context.
+//
+// The auth middlewares stash the jwtutil.UserInfo (username + groups) from the
+// VERIFIED token into the request context so downstream handlers (the RBAC
+// namespace scoper, see rbac.go) can derive the caller's authorization scope.
+// Handlers must only ever trust identity coming from this context key — it is
+// set exclusively after signature validation.
+// ---------------------------------------------------------------------------
+
+type userInfoCtxKey struct{}
+
+// withUserInfo returns a context carrying the verified caller identity.
+func withUserInfo(ctx context.Context, u jwtutil.UserInfo) context.Context {
+	return context.WithValue(ctx, userInfoCtxKey{}, u)
+}
+
+// userInfoFrom extracts the verified caller identity, if any.
+func userInfoFrom(ctx context.Context) (jwtutil.UserInfo, bool) {
+	u, ok := ctx.Value(userInfoCtxKey{}).(jwtutil.UserInfo)
+	return u, ok
+}
 
 // authConfig holds the auth-related runtime configuration.
 type authConfig struct {
@@ -137,13 +161,14 @@ func (a authConfig) requireBearer(next http.HandlerFunc) http.HandlerFunc {
 			_ = response.Unauthorized(w, fmt.Errorf("missing or malformed Authorization header"))
 			return
 		}
-		if _, err := a.validate(token); err != nil {
+		ui, err := a.validate(token)
+		if err != nil {
 			// err is jwtutil.ErrTokenExpired / ErrTokenInvalid — safe to surface
 			// (it contains no token material); both map to 401, as in snowplow.
 			_ = response.Unauthorized(w, err)
 			return
 		}
-		next(w, r)
+		next(w, r.WithContext(withUserInfo(r.Context(), ui)))
 	}
 }
 
@@ -159,11 +184,12 @@ func (a authConfig) requireSSEToken(next http.HandlerFunc) http.HandlerFunc {
 			_ = response.Unauthorized(w, fmt.Errorf("missing credentials: no bearer header, session cookie, or token query param"))
 			return
 		}
-		if _, err := a.validate(token); err != nil {
+		ui, err := a.validate(token)
+		if err != nil {
 			_ = response.Unauthorized(w, err)
 			return
 		}
-		next(w, r)
+		next(w, r.WithContext(withUserInfo(r.Context(), ui)))
 	}
 }
 

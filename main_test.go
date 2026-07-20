@@ -50,7 +50,7 @@ func mustValues(t *testing.T, raw string) url.Values {
 }
 
 func TestBuildEventsQuery_NoParams(t *testing.T) {
-	q, params, err := buildEventsQuery(url.Values{})
+	q, params, err := buildEventsQuery(url.Values{}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestBuildEventsQuery_NoParams(t *testing.T) {
 
 func TestBuildEventsQuery_WithValidComposition(t *testing.T) {
 	cid := "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
-	q, params, err := buildEventsQuery(mustValues(t, "composition_id="+cid+"&limit=10"))
+	q, params, err := buildEventsQuery(mustValues(t, "composition_id="+cid+"&limit=10"), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestBuildEventsQuery_RejectsNonUUIDCompositionID(t *testing.T) {
 		t.Run(b, func(t *testing.T) {
 			v := url.Values{}
 			v.Set("composition_id", b)
-			if _, _, err := buildEventsQuery(v); err == nil {
+			if _, _, err := buildEventsQuery(v, nil); err == nil {
 				t.Fatalf("expected error for invalid composition_id %q, got nil", b)
 			}
 		})
@@ -109,7 +109,7 @@ func TestBuildEventsQuery_RejectsNonUUIDCompositionID(t *testing.T) {
 }
 
 func TestBuildEventsQuery_ClampsLimit(t *testing.T) {
-	_, params, err := buildEventsQuery(mustValues(t, "limit=999999"))
+	_, params, err := buildEventsQuery(mustValues(t, "limit=999999"), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestClientWants(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c := &client{topic: tc.subscribed}
-			if got := c.wants(tc.msgTopic); got != tc.want {
+			if got := c.wants(sseMessage{topic: tc.msgTopic}); got != tc.want {
 				t.Fatalf("client{topic:%q}.wants(%q) = %v, want %v", tc.subscribed, tc.msgTopic, got, tc.want)
 			}
 		})
