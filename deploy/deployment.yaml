@@ -65,7 +65,7 @@ spec:
       containers:
         - name: sse-proxy
           # Built and pushed by .github/workflows/sse-proxy.yaml
-          image: ghcr.io/braghettos/krateo-sse-proxy:0.1.0
+          image: ghcr.io/krateo-platformops/sse-proxy:0.1.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

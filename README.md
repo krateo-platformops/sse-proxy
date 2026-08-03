@@ -3,7 +3,7 @@
 Stateful in-memory **Server-Sent-Events hub** for the Krateo portal notifications/events bell.
 Each pod runs its own poller (querying ClickHouse) and an SSE hub. Deployed by the
 `krateo-sse-proxy` chart in
-[`krateo-clickstack-chart`](https://github.com/braghettos/krateo-clickstack-chart).
+[`krateo-clickstack-chart`](https://github.com/krateo-platformops/krateo-clickstack-chart).
 
 > Split out of the former multi-image `krateo-clickstack` code repo so each component is a
 > single-image repo on the canonical Krateo CI (one multi-platform `release-tag.yaml`).
@@ -70,5 +70,5 @@ at startup. The proxy's ServiceAccount needs `create subjectaccessreviews` + `li
 | `KUBERNETES_API_URL` | in-cluster | API endpoint override (tests/local runs) |
 
 ## Build & release
-Image: `ghcr.io/braghettos/krateo-sse-proxy`. Pushing a semver tag (`X.Y.Z`) builds and pushes
+Image: `ghcr.io/krateo-platformops/sse-proxy`. Pushing a semver tag (`X.Y.Z`) builds and pushes
 a multi-platform (`linux/amd64,linux/arm64`) image via the canonical `release-tag.yaml`.

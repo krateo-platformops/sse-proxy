@@ -7,7 +7,7 @@
 #              (QEMU + buildx), tagged from the pushed git tag. Image = ghcr.io/<this repo>.
 #   • crds   — only acts for CRD-owning repos: runs `make generate` (the single agnostic entry
 #              point each CRD repo exposes; repos without it skip cleanly), then opens a PR into
-#              the component's chart repo (braghettos/<repo>-chart) refreshing crds-subchart/,
+#              the component's chart repo (krateo-platformops/<repo>-chart) refreshing crds-subchart/,
 #              injecting helm.sh/resource-policy: keep, and patch-bumping the crds-subchart.
 name: release-tag
 

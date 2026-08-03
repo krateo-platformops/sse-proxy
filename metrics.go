@@ -21,7 +21,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 )
 
-const meterName = "github.com/krateoplatformops/krateo-sse-proxy"
+const meterName = "github.com/krateo-platformops/sse-proxy"
 
 type proxyMetrics struct {
 	eventsDelivered metric.Int64Counter

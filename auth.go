@@ -4,7 +4,7 @@
 // (exportJwt: true) as `Authorization: Bearer <jwt>`. We validate that token
 // the SAME way the snowplow service does: stateless HMAC (HS256) verification
 // against a shared signing secret, using the krateo plumbing helper
-// github.com/krateoplatformops/plumbing/jwtutil.Validate. No JWKS, no call-out
+// github.com/krateo-platformops/plumbing/jwtutil.Validate. No JWKS, no call-out
 // to the authn service — authn signs the token with the same secret, so
 // verification is purely local (snowplow internal/handlers/middleware:
 // userconfig.go + refreshauth.go both call jwtutil.Validate).
@@ -24,8 +24,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/krateoplatformops/plumbing/http/response"
-	"github.com/krateoplatformops/plumbing/jwtutil"
+	"github.com/krateo-platformops/plumbing/http/response"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 )
 
 // ---------------------------------------------------------------------------

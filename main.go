@@ -23,7 +23,7 @@
 // derived from Kubernetes RBAC (SubjectAccessReview) and injected as a
 // mandatory filter into the ClickHouse query and the SSE fan-out; see rbac.go.
 // The only external dependency is the krateo plumbing JWT helper
-// (github.com/krateoplatformops/plumbing) plus its golang-jwt transitive; the
+// (github.com/krateo-platformops/plumbing) plus its golang-jwt transitive; the
 // ClickHouse polling + SSE hub + K8s API client remain pure standard library.
 package main
 

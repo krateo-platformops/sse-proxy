@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/krateoplatformops/plumbing/jwtutil"
+	"github.com/krateo-platformops/plumbing/jwtutil"
 )
 
 const testSigningKey = "test-shared-secret"
