@@ -10,15 +10,12 @@ on:
 
 jobs:
   build:
-    # Shared multi-platform build (linux/amd64 + linux/arm64) — see
-    # krateo-platformops/.github/.github/workflows/component-image-build.yaml
     uses: krateo-platformops/.github/.github/workflows/component-image-build.yaml@main
     permissions:
       contents: read
       packages: write
     with:
-      context: .
-
+      modules: '[{"mod":"sse-proxy","context":"."}]'
   crds:
     name: Generate & publish crds-subchart
     runs-on: ubuntu-latest
