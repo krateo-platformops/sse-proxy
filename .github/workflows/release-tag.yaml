@@ -1,65 +1,21 @@
-# Canonical Krateo COMPONENT (code-repo) release workflow — THE single way every krateo-*
-# code repo builds & pushes its image and (if it owns CRDs) publishes them. Identical
-# byte-for-byte across ALL component repos (no per-repo config); everything is derived from
-# the repo itself.
-#
-#   • build  — ONE multi-platform image (linux/amd64 + linux/arm64) via docker/build-push-action@v7
-#              (QEMU + buildx), tagged from the pushed git tag. Image = ghcr.io/<this repo>.
-#   • crds   — only acts for CRD-owning repos: runs `make generate` (the single agnostic entry
-#              point each CRD repo exposes; repos without it skip cleanly), then opens a PR into
-#              the component's chart repo (krateo-platformops/<repo>-chart) refreshing crds-subchart/,
-#              injecting helm.sh/resource-policy: keep, and patch-bumping the crds-subchart.
+# Krateo COMPONENT release workflow — sse-proxy. The `build` job now calls the SHARED reusable
+# multi-platform image build (krateo-platformops/.github) — one source of truth, no per-repo
+# drift. The `crds` job stays unchanged: it runs `make generate` (the agnostic CRD entry point)
+# and opens a PR into the component's chart repo refreshing crds-subchart/.
 name: release-tag
 
 on:
   push:
     tags: ["[0-9]+.[0-9]+.[0-9]+"]
 
-env:
-  GHCR_REPO: ghcr.io/${{ github.repository }}
-
 jobs:
   build:
-    name: Build & push image (multi-platform)
-    runs-on: ubuntu-latest
+    uses: krateo-platformops/.github/.github/workflows/component-image-build.yaml@main
     permissions:
       contents: read
       packages: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.GHCR_REPO }}
-
-      - name: Login to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      # ONE job, multi-platform manifest list built with buildx (arm64 via QEMU emulation).
-      - name: Build and push (linux/amd64, linux/arm64)
-        uses: docker/build-push-action@v7
-        with:
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-
-      - name: Inspect image
-        run: docker buildx imagetools inspect ${{ env.GHCR_REPO }}:${{ steps.meta.outputs.version }}
-
+    with:
+      modules: '[{"mod":"sse-proxy","context":"."}]'
   crds:
     name: Generate & publish crds-subchart
     runs-on: ubuntu-latest
