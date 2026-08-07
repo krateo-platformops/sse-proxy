@@ -15,3 +15,5 @@ permissions:
 jobs:
   security:
     uses: krateo-platformops/.github/.github/workflows/security.yml@main
+  lint-docs:
+    uses: krateo-platformops/.github/.github/workflows/lint-docs.yaml@main

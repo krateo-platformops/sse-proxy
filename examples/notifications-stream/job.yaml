@@ -1,0 +1,27 @@
+# One-shot in-cluster subscriber of the /notifications SSE stream: streams frames for
+# 30 s, then exits 0 (curl's max-time "error" 28 is the expected end of the demo).
+# Base URL from the fixed-name sse-proxy-internal-endpoint Secret (deployed chart).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sse-proxy-notifications-stream
+  namespace: krateo-system
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: curl
+          image: curlimages/curl:8.14.1
+          env:
+            - name: SERVER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sse-proxy-internal-endpoint
+                  key: server-url
+          command:
+            - sh
+            - -c
+            - 'curl -sN --max-time 30 "${SERVER_URL}/notifications"; rc=$?; [ "$rc" -eq 28 ] || exit "$rc"'
