@@ -1,0 +1,27 @@
+# One-shot in-cluster consumer of GET /events. The sse-proxy base URL comes from the
+# fixed-name sse-proxy-internal-endpoint Secret rendered by the deployed chart
+# (clickstack-chart charts/krateo-sse-proxy/templates/endpoint.yaml).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sse-proxy-events-snapshot
+  namespace: krateo-system
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: curl
+          image: curlimages/curl:8.14.1
+          env:
+            - name: SERVER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sse-proxy-internal-endpoint
+                  key: server-url
+          command:
+            - sh
+            - -c
+            - 'curl -sf "${SERVER_URL}/events?limit=5"'

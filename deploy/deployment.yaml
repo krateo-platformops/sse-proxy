@@ -51,7 +51,11 @@ metadata:
     app.kubernetes.io/name: krateo-sse-proxy
     app.kubernetes.io/component: sse-proxy
 spec:
-  replicas: 2
+  # Single replica, matching the deployed chart (clickstack-chart
+  # charts/krateo-sse-proxy): each pod is its own stateful in-memory hub+poller,
+  # and an L4 LB pins each client to one backend — multiple replicas mean a
+  # degraded one breaks a fixed subset of clients.
+  replicas: 1
   selector:
     matchLabels:
       app: krateo-sse-proxy
@@ -64,8 +68,11 @@ spec:
       serviceAccountName: krateo-sse-proxy
       containers:
         - name: sse-proxy
-          # Built and pushed by .github/workflows/sse-proxy.yaml
-          image: ghcr.io/krateo-platformops/sse-proxy:0.1.0
+          # Built and pushed by .github/workflows/release-tag.yaml on bare-semver
+          # tags (X.Y.Z, no v prefix). 1.1.2 is the latest published image
+          # (2026-08-07); NOTE it predates rbac.go, so the RBAC_SCOPING_* env
+          # below only takes effect on the next bare-semver release.
+          image: ghcr.io/krateo-platformops/sse-proxy:1.1.2
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -73,7 +80,9 @@ spec:
               protocol: TCP
           env:
             - name: CLICKHOUSE_URL
-              value: "http://krateo-clickstack-clickhouse-clickhouse-headless.clickhouse-system.svc:8123"
+              # The clickstack blueprint's ClickHouse (same value the deployed
+              # chart sets — it lives in krateo-system, not clickhouse-system).
+              value: "http://krateo-clickstack-clickhouse-clickhouse-headless.krateo-system.svc:8123"
             - name: CLICKHOUSE_USER
               value: "default"
             - name: CLICKHOUSE_PASSWORD
@@ -139,4 +148,6 @@ spec:
       port: 8080
       targetPort: 8080
       protocol: TCP
-  type: LoadBalancer
+  # ClusterIP, matching the deployed chart; browser exposure is the Krateo
+  # installer's job (exposure settings on the Installer CR), never a per-service LB.
+  type: ClusterIP
