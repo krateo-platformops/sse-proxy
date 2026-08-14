@@ -2,27 +2,35 @@
 //
 // The Krateo portal's RESTAction forwards the signed-in user's JWT
 // (exportJwt: true) as `Authorization: Bearer <jwt>`. We validate that token
-// the SAME way the snowplow service does: stateless HMAC (HS256) verification
-// against a shared signing secret, using the krateo plumbing helper
-// github.com/krateo-platformops/plumbing/jwtutil.Validate. No JWKS, no call-out
-// to the authn service — authn signs the token with the same secret, so
-// verification is purely local (snowplow internal/handlers/middleware:
-// userconfig.go + refreshauth.go both call jwtutil.Validate).
+// the SAME way the snowplow service does: stateless RS256 signature
+// verification against authn's PUBLIC key, resolved by the token's "kid" from
+// authn's JWKS endpoint (GET /.well-known/jwks.json) via the krateo plumbing
+// helper github.com/krateo-platformops/plumbing/jwtutil.ValidateWithKeySource.
+// authn signs with its RSA private key and publishes the matching public key
+// set, so this proxy holds NO shared secret and key rotation needs no redeploy
+// here (snowplow internal/handlers/middleware userconfig.go + refreshauth.go
+// call the same ValidateWithKeySource). Only RS256 is accepted — a token
+// offering HMAC is rejected before the key is consulted, so algorithm confusion
+// is impossible.
 //
-// The signing secret comes from JWT_SIGN_KEY — the identical env/flag snowplow
-// and authn read (snowplow main.go: flag "jwt-sign-key", env JWT_SIGN_KEY).
+// The JWKS URL is derived from authn's base URL — URL_AUTHN (the identical env
+// snowplow reads), joined with /.well-known/jwks.json — or set directly via
+// JWT_JWKS_URL.
 //
-// Auth is OPT-IN: when JWT_SIGN_KEY is empty the middleware is a pass-through,
-// preserving the proxy's previous unauthenticated behaviour for deployments
-// that have not yet wired the secret. Set JWT_SIGN_KEY to enforce it.
+// Auth ENFORCES by default: URL_AUTHN carries a cluster-internal default so the
+// key source is always built. To run the proxy open (e.g. a local dev harness),
+// set BOTH URL_AUTHN and JWT_JWKS_URL empty — the middleware then pass-throughs
+// (logged loudly at startup).
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/krateo-platformops/plumbing/http/response"
 	"github.com/krateo-platformops/plumbing/jwtutil"
@@ -53,9 +61,11 @@ func userInfoFrom(ctx context.Context) (jwtutil.UserInfo, bool) {
 
 // authConfig holds the auth-related runtime configuration.
 type authConfig struct {
-	// signingKey is the shared HMAC secret used to verify the JWT signature.
-	// Empty disables auth (pass-through).
-	signingKey string
+	// keys resolves authn's RSA public keys (by "kid") from authn's JWKS
+	// endpoint. nil disables auth (pass-through).
+	keys jwtutil.KeySource
+	// jwksURL is the resolved JWKS document URL, kept for the startup log line.
+	jwksURL string
 	// sessionCookie is the cookie name the SSE/EventSource path reads the token
 	// from when no Authorization header is present (matches snowplow's
 	// REFRESH_SESSION_COOKIE, default "krateo-session").
@@ -63,9 +73,23 @@ type authConfig struct {
 }
 
 const (
-	// envJWTSignKey is the shared HMAC signing secret. Identical name to
-	// snowplow's and authn's flag/env so a single value validates everywhere.
-	envJWTSignKey = "JWT_SIGN_KEY"
+	// envURLAuthn is authn's base URL; the JWKS document is derived from it as
+	// <URL_AUTHN>/.well-known/jwks.json. Identical env to snowplow's URL_AUTHN,
+	// so one value configures every verifier.
+	envURLAuthn     = "URL_AUTHN"
+	defaultURLAuthn = "http://authn.krateo-system.svc.cluster.local:8082"
+
+	// envJWKSURL optionally sets the full JWKS document URL directly, overriding
+	// the URL_AUTHN-derived one.
+	envJWKSURL = "JWT_JWKS_URL"
+
+	// JWKS cache/refresh/timeout knobs — same env names + defaults as snowplow.
+	envJWKSCacheTTL       = "JWT_JWKS_CACHE_TTL"
+	envJWKSMinRefresh     = "JWT_JWKS_MIN_REFRESH_INTERVAL"
+	envJWKSRequestTimeout = "JWT_JWKS_REQUEST_TIMEOUT"
+	defaultJWKSCacheTTL   = 5 * time.Minute
+	defaultJWKSMinRefresh = 30 * time.Second
+	defaultJWKSTimeout    = 5 * time.Second
 
 	// envSessionCookie / defaultSessionCookie mirror snowplow's RefreshAuth.
 	envSessionCookie     = "REFRESH_SESSION_COOKIE"
@@ -73,14 +97,40 @@ const (
 )
 
 func loadAuthConfig() authConfig {
+	// Prefer an explicit JWKS URL; otherwise derive it from authn's base URL.
+	jwksURL := strings.TrimSpace(getEnv(envJWKSURL, ""))
+	if jwksURL == "" {
+		if base := strings.TrimSpace(getEnv(envURLAuthn, defaultURLAuthn)); base != "" {
+			jwksURL = jwtutil.JWKSURL(base)
+		}
+	}
+	var keys jwtutil.KeySource
+	if jwksURL != "" {
+		keys = jwtutil.NewJWKSKeySource(jwksURL,
+			jwtutil.WithJWKSCacheTTL(getEnvDuration(envJWKSCacheTTL, defaultJWKSCacheTTL)),
+			jwtutil.WithJWKSMinRefreshInterval(getEnvDuration(envJWKSMinRefresh, defaultJWKSMinRefresh)),
+			jwtutil.WithJWKSRequestTimeout(getEnvDuration(envJWKSRequestTimeout, defaultJWKSTimeout)))
+	}
 	return authConfig{
-		signingKey:    getEnv(envJWTSignKey, ""),
+		keys:          keys,
+		jwksURL:       jwksURL,
 		sessionCookie: getEnv(envSessionCookie, defaultSessionCookie),
 	}
 }
 
+// getEnvDuration reads a time.Duration from the environment, falling back to the
+// default when unset or unparseable.
+func getEnvDuration(key string, fallback time.Duration) time.Duration {
+	if v := strings.TrimSpace(getEnv(key, "")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return fallback
+}
+
 // enabled reports whether token validation is enforced.
-func (a authConfig) enabled() bool { return a.signingKey != "" }
+func (a authConfig) enabled() bool { return a.keys != nil }
 
 // bearerFromHeader extracts the token from an `Authorization: Bearer <jwt>`
 // header. Parsing rule is identical to snowplow (split on the first space into
@@ -140,11 +190,25 @@ func (a authConfig) tokenFromRequestSSE(r *http.Request) (string, bool) {
 	return "", false
 }
 
-// validate verifies the token exactly as snowplow does (jwtutil.Validate:
-// HS256 against signingKey, 5s leeway, exp enforced; iss/aud not checked). The
-// returned UserInfo carries the username + groups from the verified claims.
+// validate verifies the token exactly as snowplow does: stateless RS256
+// signature verification, resolving authn's public key by the token's "kid"
+// through the JWKS key source (5s leeway, exp enforced; iss/aud not checked).
+// The returned UserInfo carries the username + groups from the verified claims.
 func (a authConfig) validate(token string) (jwtutil.UserInfo, error) {
-	return jwtutil.Validate(a.signingKey, token)
+	return jwtutil.ValidateWithKeySource(a.keys, token)
+}
+
+// writeAuthError maps a validation failure to the right status. A token fault
+// (expired/invalid) is 401. An inability to obtain authn's key (JWKS
+// unreachable / unknown kid) is a transient 503 that says nothing about the
+// token — mirroring snowplow, so an authn outage does not masquerade as a bad
+// credential.
+func writeAuthError(w http.ResponseWriter, err error) {
+	if errors.Is(err, jwtutil.ErrKeyUnavailable) {
+		_ = response.ServiceUnavailable(w, err)
+		return
+	}
+	_ = response.Unauthorized(w, err)
 }
 
 // requireBearer wraps a handler with Authorization: Bearer (or cookie)
@@ -163,9 +227,9 @@ func (a authConfig) requireBearer(next http.HandlerFunc) http.HandlerFunc {
 		}
 		ui, err := a.validate(token)
 		if err != nil {
-			// err is jwtutil.ErrTokenExpired / ErrTokenInvalid — safe to surface
-			// (it contains no token material); both map to 401, as in snowplow.
-			_ = response.Unauthorized(w, err)
+			// 401 for a token fault, 503 for an unavailable key — both carry no
+			// token material.
+			writeAuthError(w, err)
 			return
 		}
 		next(w, r.WithContext(withUserInfo(r.Context(), ui)))
@@ -186,7 +250,7 @@ func (a authConfig) requireSSEToken(next http.HandlerFunc) http.HandlerFunc {
 		}
 		ui, err := a.validate(token)
 		if err != nil {
-			_ = response.Unauthorized(w, err)
+			writeAuthError(w, err)
 			return
 		}
 		next(w, r.WithContext(withUserInfo(r.Context(), ui)))
@@ -194,16 +258,17 @@ func (a authConfig) requireSSEToken(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // logStatus prints a one-line summary of the auth posture at startup, without
-// ever printing the secret itself.
+// ever printing key material.
 func (a authConfig) logStatus() {
 	if a.enabled() {
-		slogInfo("sse-proxy", "auth ENABLED (HS256); SSE token via Authorization header, cookie, or ?access_token=/?token=",
-			slog.String("sign_key_env", envJWTSignKey),
+		slogInfo("sse-proxy", "auth ENABLED (RS256/JWKS); SSE token via Authorization header, cookie, or ?access_token=/?token=",
+			slog.String("jwks_url", a.jwksURL),
 			slog.String("session_cookie", a.sessionCookie),
 		)
 	} else {
-		slogInfo("sse-proxy", "auth DISABLED — all endpoints are open; set the sign key env to enforce JWT validation",
-			slog.String("sign_key_env", envJWTSignKey),
+		slogInfo("sse-proxy", "auth DISABLED — all endpoints are open; set URL_AUTHN or JWT_JWKS_URL to enforce RS256/JWKS validation",
+			slog.String("url_authn_env", envURLAuthn),
+			slog.String("jwks_url_env", envJWKSURL),
 		)
 	}
 }

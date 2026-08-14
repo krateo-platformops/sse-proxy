@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -9,17 +11,42 @@ import (
 	"github.com/krateo-platformops/plumbing/jwtutil"
 )
 
-const testSigningKey = "test-shared-secret"
+// authn now signs RS256, so tests mint tokens with an RSA private key and verify
+// them against the matching public key via an in-memory StaticKeySource (the
+// same adapter plumbing exposes for the JWKS-less form) — no mock JWKS server
+// needed. testKeyID is the "kid" stamped in every minted token's header.
+const testKeyID = "test-kid"
 
-// mint creates a token exactly as authn/snowplow do (jwtutil.CreateToken,
-// HS256, same KrateoClaims). A negative duration yields an already-expired one.
+var testPrivateKey = mustGenerateRSAKey()
+
+func mustGenerateRSAKey() *rsa.PrivateKey {
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic("generating RSA test key: " + err.Error())
+	}
+	return k
+}
+
+// testAuthConfig builds an authConfig whose key source trusts testPrivateKey's
+// public key for every kid (StaticKeySource) — the enabled/enforcing state.
+func testAuthConfig() authConfig {
+	return authConfig{
+		keys:          jwtutil.NewStaticKeySource(&testPrivateKey.PublicKey),
+		jwksURL:       "static://test",
+		sessionCookie: defaultSessionCookie,
+	}
+}
+
+// mint creates a token exactly as authn does (jwtutil.CreateToken, RS256, same
+// KrateoClaims). A negative duration yields an already-expired one.
 func mint(t *testing.T, dur time.Duration) string {
 	t.Helper()
 	tok, err := jwtutil.CreateToken(jwtutil.CreateTokenOptions{
 		Username:   "alice",
 		Groups:     []string{"devs"},
 		Duration:   dur,
-		SigningKey: testSigningKey,
+		KeyID:      testKeyID,
+		PrivateKey: testPrivateKey,
 	})
 	if err != nil {
 		t.Fatalf("CreateToken: %v", err)
@@ -30,7 +57,7 @@ func mint(t *testing.T, dur time.Duration) string {
 func okHandler(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
 
 func TestRequireBearer_Enabled(t *testing.T) {
-	a := authConfig{signingKey: testSigningKey, sessionCookie: defaultSessionCookie}
+	a := testAuthConfig()
 	h := a.requireBearer(okHandler)
 
 	cases := []struct {
@@ -66,9 +93,12 @@ func TestRequireBearer_Enabled(t *testing.T) {
 			wantStatus: http.StatusUnauthorized,
 		},
 		{
-			name: "token signed with wrong key",
+			name: "token signed with a different key",
 			setup: func(r *http.Request) {
-				other, _ := jwtutil.CreateToken(jwtutil.CreateTokenOptions{Username: "x", Duration: time.Hour, SigningKey: "different-secret"})
+				otherKey := mustGenerateRSAKey()
+				other, _ := jwtutil.CreateToken(jwtutil.CreateTokenOptions{
+					Username: "x", Duration: time.Hour, KeyID: testKeyID, PrivateKey: otherKey,
+				})
 				r.Header.Set("Authorization", "Bearer "+other)
 			},
 			wantStatus: http.StatusUnauthorized,
@@ -98,7 +128,7 @@ func TestRequireBearer_Enabled(t *testing.T) {
 }
 
 func TestRequireSSEToken_Enabled(t *testing.T) {
-	a := authConfig{signingKey: testSigningKey, sessionCookie: defaultSessionCookie}
+	a := testAuthConfig()
 	h := a.requireSSEToken(okHandler)
 
 	cases := []struct {

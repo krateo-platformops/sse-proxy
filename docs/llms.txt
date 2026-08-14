@@ -3,9 +3,9 @@
 # One line per file; regenerate the pin on release (bare-semver tags only, no v prefix).
 # The deployed Helm chart is NOT in this repo: clickstack-chart charts/krateo-sse-proxy.
 docs/index.md: the map — what sse-proxy is + links to the whole bundle; the release-state note
-docs/overview.md: how it works — ClickHouse poller, in-memory hub/topics, opt-in auth + RBAC scoping, gated OTel
+docs/overview.md: how it works — ClickHouse poller, in-memory hub/topics, RS256/JWKS auth (enforced by default) + RBAC scoping, gated OTel
 docs/usage.md: how it reaches a cluster — installer via clickstack-chart, standalone helm, deploy/ manifest, local run
-docs/configuration.md: every env var with defaults + how the deployed chart wires them (auth/scoping/OTel off in stock)
+docs/configuration.md: every env var with defaults + how the deployed chart wires them (auth enforced in stock via the URL_AUTHN default; scoping/OTel off)
 docs/api.md: the HTTP/SSE contract — /events, /notifications, /health, SSEK8sEvent, failure modes, metrics
 docs/examples.md: index of the runnable examples
 docs/release.md: bare-semver tag → shared image build; rollout via clickstack-chart; the no-op crds-job convention
@@ -16,7 +16,7 @@ examples/notifications-stream/README.md: one-shot Job streaming raw SSE frames f
 examples/notifications-stream/job.yaml: the manifest — kubectl apply -f
 # Code-adjacent internals (authoritative): the package/file doc comments in the nine Go files.
 main.go: poller + hub + HTTP surface (pollSQL, topics, /events query building, SSE handler)
-auth.go: opt-in HS256 JWT validation (snowplow-identical), token acceptance order, context identity
+auth.go: RS256/JWKS JWT validation against authn's public key (snowplow-identical, enforced by default), token acceptance order, context identity
 rbac.go: SubjectAccessReview-derived namespace scoping — fail-closed, cached, stdlib-only kube client
 telemetry.go: gated default-off OTel setup (OTEL_ENABLED master + per-signal overrides)
 metrics.go: the three sse_proxy_* instruments

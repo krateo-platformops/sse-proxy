@@ -37,11 +37,11 @@
 //
 // (see deploy/deployment.yaml).
 //
-// Scoping is OPT-IN via RBAC_SCOPING_ENABLED=true (same opt-in pattern as
-// JWT auth) and REQUIRES auth to be enabled — without a verified identity
-// there is nothing to scope by, so enabling scoping without JWT_SIGN_KEY is a
-// fatal misconfiguration (the proxy refuses to start rather than serving
-// unscoped data).
+// Scoping is OPT-IN via RBAC_SCOPING_ENABLED=true and REQUIRES auth to be
+// enabled — without a verified identity there is nothing to scope by, so
+// enabling scoping while auth is disabled (URL_AUTHN and JWT_JWKS_URL both
+// empty) is a fatal misconfiguration (the proxy refuses to start rather than
+// serving unscoped data).
 package main
 
 import (

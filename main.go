@@ -17,7 +17,7 @@
 //	GET /health         unauthenticated liveness/readiness probe.
 //
 // /events and /notifications validate a krateo JWT the same way snowplow does
-// (HS256 against the shared JWT_SIGN_KEY secret) when that secret is set; see
+// (RS256 against authn's JWKS public key, derived from URL_AUTHN); see
 // auth.go. With RBAC_SCOPING_ENABLED=true both endpoints additionally enforce
 // server-side multi-tenant scoping: the caller's authorized-namespace set is
 // derived from Kubernetes RBAC (SubjectAccessReview) and injected as a
@@ -696,7 +696,7 @@ func main() {
 		os.Exit(1)
 	}
 	if scoper != nil && !auth.enabled() {
-		slogError("sse-proxy", "rbac scoping requires auth: set "+envJWTSignKey+" (scoping derives the filter from the verified caller identity)", nil)
+		slogError("sse-proxy", "rbac scoping requires auth, but it is disabled: set "+envURLAuthn+" (or "+envJWKSURL+") so the filter can derive from the verified caller identity", nil)
 		os.Exit(1)
 	}
 	scoper.logStatus()

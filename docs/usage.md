@@ -43,18 +43,20 @@ helm install sse-proxy oci://ghcr.io/krateo-platformops/charts/krateo-sse-proxy 
 
 Chart values (image, `clickhouse.*`, `service.*`, resources) are documented in
 [configuration](./configuration.md). Note the chart's deliberate `replicaCount: 1`
-(stateful in-memory hub — see [overview](./overview.md)); it does **not** wire the
-opt-in auth / RBAC-scoping env, so those features are off in a stock deploy.
+(stateful in-memory hub — see [overview](./overview.md)). The chart sets no `URL_AUTHN`,
+so the binary falls back to its cluster-internal default and a stock deploy **enforces
+auth** (RS256 against the in-cluster authn's JWKS); RBAC scoping stays off since the
+chart wires no env for it.
 
 ## Path 3 — the `deploy/` reference manifest
 
 [`deploy/deployment.yaml`](../deploy/deployment.yaml) is a standalone (non-Helm)
 reference: Deployment + Service + the ServiceAccount / ClusterRole /
 ClusterRoleBinding that RBAC scoping requires (`create subjectaccessreviews`,
-`list namespaces`). It pins the published image `1.1.2` and shows the `JWT_SIGN_KEY` +
-`RBAC_SCOPING_ENABLED` wiring — with the caveat that scoping only takes effect on an
-image built after `1.1.2` (the feature is on `main`, unreleased; see
-[release](./release.md)).
+`list namespaces`). It pins the published image `1.1.2` and shows the `URL_AUTHN` +
+`RBAC_SCOPING_ENABLED` wiring (auth is RS256/JWKS against authn, enforced by default) —
+with the caveat that scoping only takes effect on an image built after `1.1.2` (the
+feature is on `main`, unreleased; see [release](./release.md)).
 
 ```sh
 kubectl apply -f deploy/deployment.yaml
