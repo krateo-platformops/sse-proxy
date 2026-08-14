@@ -11,6 +11,22 @@ timestamp: 2026-08-07T00:00:00Z
 
 Curated history, newest first.
 
+## 2026-08-14 — JWT auth migrated to RS256/JWKS against authn (unreleased)
+
+Replaced the original shared-secret HMAC verification with stateless **RS256**
+signature verification against authn's **public** key, resolved by the token's `kid`
+from authn's **JWKS** endpoint (`<URL_AUTHN>/.well-known/jwks.json`) via
+`plumbing/jwtutil.ValidateWithKeySource` — mirroring how snowplow verifies. The proxy
+now holds no shared secret and key rotation needs no redeploy; only RS256 is accepted
+(HMAC tokens are rejected, closing off algorithm confusion). Config mirrors snowplow:
+`URL_AUTHN` (with a cluster-internal default) plus the optional `JWT_JWKS_URL` override
+and the `JWT_JWKS_CACHE_TTL` / `JWT_JWKS_MIN_REFRESH_INTERVAL` /
+`JWT_JWKS_REQUEST_TIMEOUT` tuning knobs. Auth now **enforces by default** (the
+`URL_AUTHN` default always builds a key source); to run open, set both `URL_AUTHN` and
+`JWT_JWKS_URL` empty. Errors split cleanly: a token fault is `401`, an unreachable JWKS
+endpoint or unknown `kid` is a transient `503`. `RBAC_SCOPING_ENABLED` still requires
+auth enabled (now: fatal only if `URL_AUTHN` and `JWT_JWKS_URL` are both empty).
+
 ## 2026-08-07 — adopted the Krateo Documentation Standard
 
 This bundle: root `docs/` + `examples/` + thin README, CI-linted. Fixed en route: the
@@ -51,8 +67,9 @@ top-level composition (e.g. a user blueprint). The filter now keys on the event'
 ## 2026-06-22 — 1.1.0: composition topics + snowplow-style JWT auth (#1)
 
 Per-composition SSE topics and server-side `composition_id`/`limit` filtering (bound
-ClickHouse parameters), plus opt-in HS256 JWT validation identical to snowplow's
-(`JWT_SIGN_KEY`; header/cookie/query acceptance for EventSource).
+ClickHouse parameters), plus opt-in JWT validation identical to snowplow's at the time
+(header/cookie/query acceptance for EventSource). The verification mechanism was later
+migrated to RS256/JWKS (see the 2026-08-14 entry).
 
 ## 2026-06-15 — 1.0.0: split out of `krateo-clickstack`
 

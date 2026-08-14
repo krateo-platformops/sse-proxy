@@ -27,18 +27,29 @@ Grouped by the file that reads them.
 |---|---|---|
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` — JSON slog to stderr, always on |
 
-## Authentication (`auth.go`) — opt-in
+## Authentication (`auth.go`) — enforced by default
+
+Validation is stateless **RS256** against authn's **public** key, resolved by the
+token's `kid` from authn's **JWKS** endpoint — the proxy holds no shared secret, and
+key rotation needs no redeploy (mirrors snowplow). Only RS256 is accepted (HMAC tokens
+are rejected, so algorithm confusion is impossible). Auth **enforces by default**
+because `URL_AUTHN` has a cluster-internal default; to run open (dev), set **both**
+`URL_AUTHN` and `JWT_JWKS_URL` empty ⇒ pass-through (logged loudly).
 
 | Var | Default | Purpose |
 |---|---|---|
-| `JWT_SIGN_KEY` | empty (**auth disabled**) | shared HS256 secret; must match authn/snowplow. Set ⇒ `/events` + `/notifications` require a valid Krateo JWT |
+| `URL_AUTHN` | `http://authn.krateo-system.svc.cluster.local:8082` | authn's base URL (the identical env snowplow reads); the JWKS document URL is derived as `<URL_AUTHN>/.well-known/jwks.json`. Set this **and** `JWT_JWKS_URL` empty to disable auth |
+| `JWT_JWKS_URL` | empty (derived from `URL_AUTHN`) | full JWKS document URL, overriding the `URL_AUTHN`-derived one |
+| `JWT_JWKS_CACHE_TTL` | `5m` | how long a fetched JWKS key set is cached (Go duration) |
+| `JWT_JWKS_MIN_REFRESH_INTERVAL` | `30s` | minimum gap between JWKS refetches on an unknown `kid` (Go duration) |
+| `JWT_JWKS_REQUEST_TIMEOUT` | `5s` | timeout for a single JWKS fetch (Go duration) |
 | `REFRESH_SESSION_COOKIE` | `krateo-session` | cookie name the SSE path reads the token from (snowplow's convention) |
 
 ## RBAC scoping (`rbac.go`) — opt-in, **unreleased** (on `main`, not in image `1.1.2`; see [release](./release.md))
 
 | Var | Default | Purpose |
 |---|---|---|
-| `RBAC_SCOPING_ENABLED` | `false` | enforce SubjectAccessReview-derived per-tenant namespace scoping. **Requires** `JWT_SIGN_KEY` — enabling it without auth is fatal at startup (fail closed) |
+| `RBAC_SCOPING_ENABLED` | `false` | enforce SubjectAccessReview-derived per-tenant namespace scoping. **Requires auth enabled** — enabling it with `URL_AUTHN` and `JWT_JWKS_URL` both empty is fatal at startup (fail closed) |
 | `RBAC_SCOPING_VERB` | `list` | the RBAC verb the scoping check keys on |
 | `RBAC_SCOPING_RESOURCE` | `events` | the RBAC resource |
 | `RBAC_SCOPING_APIGROUP` | empty (core) | the RBAC apiGroup |
@@ -75,8 +86,12 @@ and `LISTEN_ADDR`, from these values:
 | `listenAddr` | `:8080` |
 | `resources`, `podAnnotations`, `nodeSelector`, `tolerations`, `affinity`, `serviceAccount.*`, `imagePullSecrets` | standard knobs |
 
-Consequently a stock deploy runs with **auth, RBAC scoping and OTel all off** — the
-chart exposes no values for those env vars today. To enable them you must add the env
-to the chart (or use the [`deploy/`](../deploy/deployment.yaml) reference manifest).
-The chart also renders the fixed-name `sse-proxy-internal-endpoint` Secret
-(`server-url` pointing at its own Service) that snowplow RESTActions consume.
+Because the chart sets **no** `URL_AUTHN`, the binary falls back to its cluster-internal
+default (`http://authn.krateo-system.svc.cluster.local:8082`), so a stock deploy runs
+with **auth enforced** against the in-cluster authn's JWKS — no chart change needed. To
+run the proxy open you would have to add `URL_AUTHN` (and `JWT_JWKS_URL`) set empty to
+the chart. **RBAC scoping and OTel** stay **off** in a stock deploy — the chart exposes
+no values for those env vars today, so enabling them means adding the env to the chart
+(or using the [`deploy/`](../deploy/deployment.yaml) reference manifest). The chart also
+renders the fixed-name `sse-proxy-internal-endpoint` Secret (`server-url` pointing at
+its own Service) that snowplow RESTActions consume.

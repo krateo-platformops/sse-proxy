@@ -33,8 +33,8 @@ Everything is env vars — see [docs/configuration.md](docs/configuration.md). M
 | Var | Default | Effect |
 |---|---|---|
 | `CLICKHOUSE_URL` | in-cluster ClickHouse | where events are polled from |
-| `JWT_SIGN_KEY` | empty (auth **disabled**) | opt-in HS256 JWT validation — shared secret with authn/snowplow |
-| `RBAC_SCOPING_ENABLED` | `false` | opt-in server-side per-tenant namespace scoping (requires `JWT_SIGN_KEY`; on `main`, not yet in a published image) |
+| `URL_AUTHN` | authn in `krateo-system` | authn's base URL; the JWKS public-key set is derived from it and used to verify caller JWTs (RS256). Auth **enforces by default** — set `URL_AUTHN` and `JWT_JWKS_URL` both empty for open pass-through |
+| `RBAC_SCOPING_ENABLED` | `false` | opt-in server-side per-tenant namespace scoping (requires auth enabled; on `main`, not yet in a published image) |
 
 ## Examples
 

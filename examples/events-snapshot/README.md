@@ -19,9 +19,12 @@ RESTActions use), so it works whatever the release/Service name is.
 - A stock Krateo installer deploy with the observability (clickstack) blueprint
   enabled — the `krateo-sse-proxy` chart and its `sse-proxy-internal-endpoint` Secret
   live in `krateo-system`.
-- Auth left at the stock default (the deployed chart does not set `JWT_SIGN_KEY`, so
-  the endpoint is open in-cluster). If you enabled auth, add an
-  `Authorization: Bearer <jwt>` header to the curl.
+- Auth: a stock deploy **enforces** JWT validation (RS256 against authn's JWKS — the
+  chart sets no `URL_AUTHN`, so the binary uses its in-cluster authn default). This Job's
+  curl sends no token, so against a stock deploy `/events` answers **401**; add an
+  `Authorization: Bearer <jwt>` header (a signed Krateo JWT) to `job.yaml` to get data.
+  The plain curl succeeds only when the proxy is running open (both `URL_AUTHN` and
+  `JWT_JWKS_URL` set empty).
 
 ## Apply
 

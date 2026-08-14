@@ -1,7 +1,7 @@
 ---
 type: Architecture
 title: sse-proxy — overview
-description: How the SSE proxy works — the ClickHouse poller, the in-memory fan-out hub, topics, opt-in JWT auth, RBAC-derived tenant scoping, and gated OTel.
+description: How the SSE proxy works — the ClickHouse poller, the in-memory fan-out hub, topics, RS256/JWKS JWT auth, RBAC-derived tenant scoping, and gated OTel.
 resource: ghcr.io/krateo-platformops/sse-proxy
 tags: [architecture, sse, clickhouse, events]
 timestamp: 2026-08-07T00:00:00Z
@@ -68,15 +68,26 @@ objects, so it is absent or wrong for top-level compositions like user blueprint
 ClickHouse query parameters (`{name:Type}`), never string-concatenated; UUID / integer
 validation happens first.
 
-## Authentication (opt-in)
+## Authentication (enforced by default)
 
-With `JWT_SIGN_KEY` set, `/events` and `/notifications` validate the caller's Krateo
-JWT exactly as snowplow does: stateless HS256 via `plumbing/jwtutil.Validate` against
-the shared signing secret — no JWKS, no call-out to authn. Because the browser
-`EventSource` API cannot set headers, the SSE path also accepts the token via the
-session cookie (`krateo-session` by default) or `?access_token=` / `?token=` (accepted
-as the documented EventSource fallback; the proxy never logs request URLs). Unset key ⇒
-all endpoints open (`auth.go`).
+`/events` and `/notifications` validate the caller's Krateo JWT exactly as snowplow
+does: stateless **RS256** signature verification against authn's **public** key,
+resolved by the token's `kid` from authn's **JWKS** endpoint
+(`<URL_AUTHN>/.well-known/jwks.json`) via `plumbing/jwtutil.ValidateWithKeySource`.
+authn signs with its RSA private key and publishes the matching public key set, so the
+proxy holds **no shared secret** and key rotation needs no redeploy. Only RS256 is
+accepted — a token offering HMAC is rejected before the key is consulted, so algorithm
+confusion is impossible. Because the browser `EventSource` API cannot set headers, the
+SSE path also accepts the token via the session cookie (`krateo-session` by default) or
+`?access_token=` / `?token=` (accepted as the documented EventSource fallback; the proxy
+never logs request URLs).
+
+Auth **enforces by default**: `URL_AUTHN` carries a cluster-internal default
+(`http://authn.krateo-system.svc.cluster.local:8082`), so the key source is always
+built. To run the proxy open (e.g. a local dev harness), set **both** `URL_AUTHN` and
+`JWT_JWKS_URL` empty ⇒ all endpoints open, logged loudly at startup (`auth.go`). A token
+fault (expired/invalid) is a **401**; an unreachable JWKS endpoint or unknown `kid` is a
+transient **503** that says nothing about the token.
 
 ## Multi-tenant scoping (opt-in, `main`-only for now)
 

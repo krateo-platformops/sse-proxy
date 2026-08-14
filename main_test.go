@@ -224,7 +224,7 @@ func TestBearerFromHeader(t *testing.T) {
 }
 
 func TestTokenFromRequestSSE_Precedence(t *testing.T) {
-	a := authConfig{signingKey: "k", sessionCookie: "krateo-session"}
+	a := testAuthConfig() // sessionCookie defaults to "krateo-session"
 
 	// Header wins over cookie and query.
 	r, _ := http.NewRequest(http.MethodGet, "/notifications?access_token=qtok", nil)

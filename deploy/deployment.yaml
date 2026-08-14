@@ -93,14 +93,12 @@ spec:
                   optional: true
             - name: LISTEN_ADDR
               value: ":8080"
-            # JWT validation (shared HS256 secret with authn/snowplow) —
-            # REQUIRED when RBAC scoping is on (identity comes from the
-            # verified token; the proxy refuses to start scoped-but-unauthenticated).
-            - name: JWT_SIGN_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: jwt-sign-key
-                  key: JWT_SIGN_KEY
+            # JWT validation (RS256 against authn's JWKS public key) — the JWKS
+            # document URL is derived from authn's base URL. Enforced by default;
+            # REQUIRED when RBAC scoping is on (identity comes from the verified
+            # token; the proxy refuses to start scoped-but-unauthenticated).
+            - name: URL_AUTHN
+              value: "http://authn.krateo-system.svc.cluster.local:8082"
             # Server-side multi-tenant scoping: filter events by the caller's
             # RBAC-authorized namespaces (SubjectAccessReview-derived, fail-closed).
             - name: RBAC_SCOPING_ENABLED
