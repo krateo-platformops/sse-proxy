@@ -17,10 +17,12 @@
 // snowplow reads), joined with /.well-known/jwks.json — or set directly via
 // JWT_JWKS_URL.
 //
-// Auth ENFORCES by default: URL_AUTHN carries a cluster-internal default so the
-// key source is always built. To run the proxy open (e.g. a local dev harness),
-// set BOTH URL_AUTHN and JWT_JWKS_URL empty — the middleware then pass-throughs
-// (logged loudly at startup).
+// Verification is MANDATORY BY DESIGN — there is no pass-through / open mode.
+// URL_AUTHN carries a cluster-internal default so the JWKS source is always
+// built; if it is deliberately blanked (URL_AUTHN and JWT_JWKS_URL both empty)
+// the proxy refuses to start rather than serving unauthenticated, so auth can
+// never be silently turned off. Point URL_AUTHN/JWT_JWKS_URL at a fake JWKS to
+// exercise a local dev harness.
 package main
 
 import (
@@ -62,7 +64,8 @@ func userInfoFrom(ctx context.Context) (jwtutil.UserInfo, bool) {
 // authConfig holds the auth-related runtime configuration.
 type authConfig struct {
 	// keys resolves authn's RSA public keys (by "kid") from authn's JWKS
-	// endpoint. nil disables auth (pass-through).
+	// endpoint. Always non-nil in a running proxy — loadAuthConfig fails rather
+	// than leave it unset, so verification is never skipped.
 	keys jwtutil.KeySource
 	// jwksURL is the resolved JWKS document URL, kept for the startup log line.
 	jwksURL string
@@ -96,7 +99,13 @@ const (
 	defaultSessionCookie = "krateo-session"
 )
 
-func loadAuthConfig() authConfig {
+// loadAuthConfig builds the auth config. Verification is MANDATORY BY DESIGN:
+// there is no pass-through / open mode. A JWKS source is always required, so a
+// config that cannot resolve one (URL_AUTHN and JWT_JWKS_URL both blank) is a
+// fatal misconfiguration surfaced here rather than a silent fail-open. URL_AUTHN
+// carries a cluster-internal default, so the resolution only fails if it is
+// deliberately blanked.
+func loadAuthConfig() (authConfig, error) {
 	// Prefer an explicit JWKS URL; otherwise derive it from authn's base URL.
 	jwksURL := strings.TrimSpace(getEnv(envJWKSURL, ""))
 	if jwksURL == "" {
@@ -104,18 +113,18 @@ func loadAuthConfig() authConfig {
 			jwksURL = jwtutil.JWKSURL(base)
 		}
 	}
-	var keys jwtutil.KeySource
-	if jwksURL != "" {
-		keys = jwtutil.NewJWKSKeySource(jwksURL,
-			jwtutil.WithJWKSCacheTTL(getEnvDuration(envJWKSCacheTTL, defaultJWKSCacheTTL)),
-			jwtutil.WithJWKSMinRefreshInterval(getEnvDuration(envJWKSMinRefresh, defaultJWKSMinRefresh)),
-			jwtutil.WithJWKSRequestTimeout(getEnvDuration(envJWKSRequestTimeout, defaultJWKSTimeout)))
+	if jwksURL == "" {
+		return authConfig{}, fmt.Errorf("no JWKS source: set %s (authn base URL) or %s — token verification is mandatory and cannot be disabled", envURLAuthn, envJWKSURL)
 	}
+	keys := jwtutil.NewJWKSKeySource(jwksURL,
+		jwtutil.WithJWKSCacheTTL(getEnvDuration(envJWKSCacheTTL, defaultJWKSCacheTTL)),
+		jwtutil.WithJWKSMinRefreshInterval(getEnvDuration(envJWKSMinRefresh, defaultJWKSMinRefresh)),
+		jwtutil.WithJWKSRequestTimeout(getEnvDuration(envJWKSRequestTimeout, defaultJWKSTimeout)))
 	return authConfig{
 		keys:          keys,
 		jwksURL:       jwksURL,
 		sessionCookie: getEnv(envSessionCookie, defaultSessionCookie),
-	}
+	}, nil
 }
 
 // getEnvDuration reads a time.Duration from the environment, falling back to the
@@ -128,9 +137,6 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	}
 	return fallback
 }
-
-// enabled reports whether token validation is enforced.
-func (a authConfig) enabled() bool { return a.keys != nil }
 
 // bearerFromHeader extracts the token from an `Authorization: Bearer <jwt>`
 // header. Parsing rule is identical to snowplow (split on the first space into
@@ -212,12 +218,9 @@ func writeAuthError(w http.ResponseWriter, err error) {
 }
 
 // requireBearer wraps a handler with Authorization: Bearer (or cookie)
-// validation — used for the plain HTTP /events endpoint. A no-op when auth is
-// disabled.
+// validation — used for the plain HTTP /events endpoint. Verification is
+// mandatory: there is no pass-through.
 func (a authConfig) requireBearer(next http.HandlerFunc) http.HandlerFunc {
-	if !a.enabled() {
-		return next
-	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		token, ok := a.tokenFromRequestHeaderOrCookie(r)
 		if !ok {
@@ -237,11 +240,9 @@ func (a authConfig) requireBearer(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // requireSSEToken wraps the SSE handler, accepting the token via header,
-// cookie, or query param (EventSource fallback). A no-op when auth is disabled.
+// cookie, or query param (EventSource fallback). Verification is mandatory:
+// there is no pass-through.
 func (a authConfig) requireSSEToken(next http.HandlerFunc) http.HandlerFunc {
-	if !a.enabled() {
-		return next
-	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		token, ok := a.tokenFromRequestSSE(r)
 		if !ok {
@@ -260,15 +261,8 @@ func (a authConfig) requireSSEToken(next http.HandlerFunc) http.HandlerFunc {
 // logStatus prints a one-line summary of the auth posture at startup, without
 // ever printing key material.
 func (a authConfig) logStatus() {
-	if a.enabled() {
-		slogInfo("sse-proxy", "auth ENABLED (RS256/JWKS); SSE token via Authorization header, cookie, or ?access_token=/?token=",
-			slog.String("jwks_url", a.jwksURL),
-			slog.String("session_cookie", a.sessionCookie),
-		)
-	} else {
-		slogInfo("sse-proxy", "auth DISABLED — all endpoints are open; set URL_AUTHN or JWT_JWKS_URL to enforce RS256/JWKS validation",
-			slog.String("url_authn_env", envURLAuthn),
-			slog.String("jwks_url_env", envJWKSURL),
-		)
-	}
+	slogInfo("sse-proxy", "auth ENFORCED (RS256/JWKS, mandatory); SSE token via Authorization header, cookie, or ?access_token=/?token=",
+		slog.String("jwks_url", a.jwksURL),
+		slog.String("session_cookie", a.sessionCookie),
+	)
 }

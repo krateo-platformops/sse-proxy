@@ -685,18 +685,21 @@ func main() {
 	initLogging()
 
 	cfg := loadConfig()
-	auth := loadAuthConfig()
+	// Token verification is mandatory by design; a config that cannot resolve a
+	// JWKS source is fatal (never fail-open to serving unauthenticated).
+	auth, err := loadAuthConfig()
+	if err != nil {
+		slogError("sse-proxy", "auth configuration failed — token verification is mandatory", err)
+		os.Exit(1)
+	}
 	auth.logStatus()
 
 	// RBAC-derived multi-tenant scoping (see rbac.go). Misconfiguration is
-	// fatal — the proxy must never start half-scoped (fail closed).
+	// fatal — the proxy must never start half-scoped (fail closed). Auth is
+	// always enforced above, so the scoper always has a verified identity.
 	scoper, err := loadRBACScoper()
 	if err != nil {
 		slogError("sse-proxy", "rbac scoping init failed", err)
-		os.Exit(1)
-	}
-	if scoper != nil && !auth.enabled() {
-		slogError("sse-proxy", "rbac scoping requires auth, but it is disabled: set "+envURLAuthn+" (or "+envJWKSURL+") so the filter can derive from the verified caller identity", nil)
 		os.Exit(1)
 	}
 	scoper.logStatus()

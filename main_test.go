@@ -259,17 +259,3 @@ func TestTokenFromRequestSSE_Precedence(t *testing.T) {
 		t.Errorf("expected no token, got (%q,%v)", tok, ok)
 	}
 }
-
-func TestRequireBearer_DisabledIsPassthrough(t *testing.T) {
-	a := authConfig{} // no signing key => disabled
-	if a.enabled() {
-		t.Fatal("auth should be disabled with empty signing key")
-	}
-	called := false
-	h := a.requireBearer(func(http.ResponseWriter, *http.Request) { called = true })
-	r, _ := http.NewRequest(http.MethodGet, "/events", nil)
-	h(nil, r)
-	if !called {
-		t.Error("disabled auth must pass through to the wrapped handler")
-	}
-}
