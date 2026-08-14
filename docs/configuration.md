@@ -27,18 +27,21 @@ Grouped by the file that reads them.
 |---|---|---|
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` — JSON slog to stderr, always on |
 
-## Authentication (`auth.go`) — enforced by default
+## Authentication (`auth.go`) — mandatory, enforced by design
 
 Validation is stateless **RS256** against authn's **public** key, resolved by the
 token's `kid` from authn's **JWKS** endpoint — the proxy holds no shared secret, and
 key rotation needs no redeploy (mirrors snowplow). Only RS256 is accepted (HMAC tokens
-are rejected, so algorithm confusion is impossible). Auth **enforces by default**
-because `URL_AUTHN` has a cluster-internal default; to run open (dev), set **both**
-`URL_AUTHN` and `JWT_JWKS_URL` empty ⇒ pass-through (logged loudly).
+are rejected, so algorithm confusion is impossible). Auth is **mandatory** — there is
+no open/pass-through mode. `URL_AUTHN` has a cluster-internal default, so a JWKS source
+is normally always resolved; if **both** `URL_AUTHN` and `JWT_JWKS_URL` are empty the
+proxy **refuses to start** (fatal error, logged as `auth ENFORCED (RS256/JWKS,
+mandatory)`) rather than serving unauthenticated. For a local dev harness, point
+`URL_AUTHN` / `JWT_JWKS_URL` at a fake JWKS server instead.
 
 | Var | Default | Purpose |
 |---|---|---|
-| `URL_AUTHN` | `http://authn.krateo-system.svc.cluster.local:8082` | authn's base URL (the identical env snowplow reads); the JWKS document URL is derived as `<URL_AUTHN>/.well-known/jwks.json`. Set this **and** `JWT_JWKS_URL` empty to disable auth |
+| `URL_AUTHN` | `http://authn.krateo-system.svc.cluster.local:8082` | authn's base URL (the identical env snowplow reads); the JWKS document URL is derived as `<URL_AUTHN>/.well-known/jwks.json`. Setting this **and** `JWT_JWKS_URL` empty does **not** disable auth — with no JWKS source the proxy refuses to start (fail-closed) |
 | `JWT_JWKS_URL` | empty (derived from `URL_AUTHN`) | full JWKS document URL, overriding the `URL_AUTHN`-derived one |
 | `JWT_JWKS_CACHE_TTL` | `5m` | how long a fetched JWKS key set is cached (Go duration) |
 | `JWT_JWKS_MIN_REFRESH_INTERVAL` | `30s` | minimum gap between JWKS refetches on an unknown `kid` (Go duration) |
@@ -49,7 +52,7 @@ because `URL_AUTHN` has a cluster-internal default; to run open (dev), set **bot
 
 | Var | Default | Purpose |
 |---|---|---|
-| `RBAC_SCOPING_ENABLED` | `false` | enforce SubjectAccessReview-derived per-tenant namespace scoping. **Requires auth enabled** — enabling it with `URL_AUTHN` and `JWT_JWKS_URL` both empty is fatal at startup (fail closed) |
+| `RBAC_SCOPING_ENABLED` | `false` | enforce SubjectAccessReview-derived per-tenant namespace scoping. **Requires the JWKS source to resolve** (auth is always on); since the proxy already refuses to start with `URL_AUTHN` and `JWT_JWKS_URL` both empty, scoping identity is always backed by a verified token |
 | `RBAC_SCOPING_VERB` | `list` | the RBAC verb the scoping check keys on |
 | `RBAC_SCOPING_RESOURCE` | `events` | the RBAC resource |
 | `RBAC_SCOPING_APIGROUP` | empty (core) | the RBAC apiGroup |
@@ -88,9 +91,10 @@ and `LISTEN_ADDR`, from these values:
 
 Because the chart sets **no** `URL_AUTHN`, the binary falls back to its cluster-internal
 default (`http://authn.krateo-system.svc.cluster.local:8082`), so a stock deploy runs
-with **auth enforced** against the in-cluster authn's JWKS — no chart change needed. To
-run the proxy open you would have to add `URL_AUTHN` (and `JWT_JWKS_URL`) set empty to
-the chart. **RBAC scoping and OTel** stay **off** in a stock deploy — the chart exposes
+with **auth enforced** against the in-cluster authn's JWKS — no chart change needed.
+There is no open/pass-through mode to opt into: clearing `URL_AUTHN` (and `JWT_JWKS_URL`)
+would leave no JWKS source, and the proxy would refuse to start rather than serve
+unauthenticated. **RBAC scoping and OTel** stay **off** in a stock deploy — the chart exposes
 no values for those env vars today, so enabling them means adding the env to the chart
 (or using the [`deploy/`](../deploy/deployment.yaml) reference manifest). The chart also
 renders the fixed-name `sse-proxy-internal-endpoint` Secret (`server-url` pointing at

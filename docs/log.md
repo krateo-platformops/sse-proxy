@@ -11,6 +11,19 @@ timestamp: 2026-08-07T00:00:00Z
 
 Curated history, newest first.
 
+## 2026-08-14 — auth hardened to mandatory-by-design (no pass-through, unreleased)
+
+Removed the escape hatch: the proxy now has **no open/pass-through mode**. If no JWKS
+source can be resolved — i.e. `URL_AUTHN` **and** `JWT_JWKS_URL` are both empty — it is
+a **fatal error at startup** and the process refuses to start rather than serving
+unauthenticated. The startup log line is now `auth ENFORCED (RS256/JWKS, mandatory)`.
+This supersedes the earlier "enforced by default (fatal only if both empty)" note below:
+enforcement is no longer a default you could opt out of by blanking both vars — that
+combination is now fail-closed, not open. For a local dev harness, point `URL_AUTHN` /
+`JWT_JWKS_URL` at a fake JWKS server instead of trying to disable auth.
+`RBAC_SCOPING_ENABLED` stays genuinely opt-in; since auth is always on, it now just
+requires the JWKS source to resolve.
+
 ## 2026-08-14 — JWT auth migrated to RS256/JWKS against authn (unreleased)
 
 Replaced the original shared-secret HMAC verification with stateless **RS256**

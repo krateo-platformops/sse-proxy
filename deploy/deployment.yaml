@@ -94,9 +94,10 @@ spec:
             - name: LISTEN_ADDR
               value: ":8080"
             # JWT validation (RS256 against authn's JWKS public key) — the JWKS
-            # document URL is derived from authn's base URL. Enforced by default;
-            # REQUIRED when RBAC scoping is on (identity comes from the verified
-            # token; the proxy refuses to start scoped-but-unauthenticated).
+            # document URL is derived from authn's base URL. Auth is mandatory:
+            # with URL_AUTHN and JWT_JWKS_URL both empty the proxy refuses to
+            # start (fail-closed), so there is no open/pass-through mode. This
+            # also backs RBAC scoping, whose identity comes from the verified token.
             - name: URL_AUTHN
               value: "http://authn.krateo-system.svc.cluster.local:8082"
             # Server-side multi-tenant scoping: filter events by the caller's

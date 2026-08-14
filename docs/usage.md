@@ -54,7 +54,7 @@ chart wires no env for it.
 reference: Deployment + Service + the ServiceAccount / ClusterRole /
 ClusterRoleBinding that RBAC scoping requires (`create subjectaccessreviews`,
 `list namespaces`). It pins the published image `1.1.2` and shows the `URL_AUTHN` +
-`RBAC_SCOPING_ENABLED` wiring (auth is RS256/JWKS against authn, enforced by default) —
+`RBAC_SCOPING_ENABLED` wiring (auth is RS256/JWKS against authn, always enforced) —
 with the caveat that scoping only takes effect on an image built after `1.1.2` (the
 feature is on `main`, unreleased; see [release](./release.md)).
 

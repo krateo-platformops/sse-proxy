@@ -68,7 +68,7 @@ objects, so it is absent or wrong for top-level compositions like user blueprint
 ClickHouse query parameters (`{name:Type}`), never string-concatenated; UUID / integer
 validation happens first.
 
-## Authentication (enforced by default)
+## Authentication (mandatory, enforced by design)
 
 `/events` and `/notifications` validate the caller's Krateo JWT exactly as snowplow
 does: stateless **RS256** signature verification against authn's **public** key,
@@ -82,11 +82,14 @@ SSE path also accepts the token via the session cookie (`krateo-session` by defa
 `?access_token=` / `?token=` (accepted as the documented EventSource fallback; the proxy
 never logs request URLs).
 
-Auth **enforces by default**: `URL_AUTHN` carries a cluster-internal default
-(`http://authn.krateo-system.svc.cluster.local:8082`), so the key source is always
-built. To run the proxy open (e.g. a local dev harness), set **both** `URL_AUTHN` and
-`JWT_JWKS_URL` empty ⇒ all endpoints open, logged loudly at startup (`auth.go`). A token
-fault (expired/invalid) is a **401**; an unreachable JWKS endpoint or unknown `kid` is a
+Auth is **mandatory by design** — there is no open/pass-through mode. `URL_AUTHN`
+carries a cluster-internal default (`http://authn.krateo-system.svc.cluster.local:8082`),
+so the key source is normally always built. If a JWKS source can't be resolved — i.e.
+**both** `URL_AUTHN` and `JWT_JWKS_URL` are empty — the proxy **refuses to start**
+(fatal error at startup, logged as `auth ENFORCED (RS256/JWKS, mandatory)`); it will
+never serve unauthenticated (`auth.go`). For a local dev harness, point `URL_AUTHN` /
+`JWT_JWKS_URL` at a fake JWKS server instead of trying to disable auth. A token fault
+(expired/invalid) is a **401**; an unreachable JWKS endpoint or unknown `kid` is a
 transient **503** that says nothing about the token.
 
 ## Multi-tenant scoping (opt-in, `main`-only for now)
