@@ -474,13 +474,33 @@ ORDER BY Timestamp DESC
 LIMIT {limit:UInt32}
 FORMAT JSONEachRow`
 
-// compositionIDFilter is the predicate appended to the WHERE clause when a
-// composition_id is supplied. It keys on the event's own involvedObject uid
-// (the composition CR's uid) — NOT LogAttributes['krateo.io/composition-id'],
-// which the collector resolves to the *owning* composition (and only for
-// pod-associated objects), so it is absent/wrong for top-level compositions
-// like user blueprints. The value is bound, not interpolated.
-const compositionIDFilter = "\n  AND JSONExtractString(Body, 'object', 'involvedObject', 'uid') = {composition_id:String}"
+// compositionIDFilter selects a composition's events — BOTH the events on the
+// composition CR itself AND the events on the resources it manages. Those are
+// two different predicates because they are two different mechanisms, and each
+// one alone returns only half the feed:
+//
+//   - the composition CR's OWN events (its reconcile events) carry
+//     involvedObject.uid == the composition uid, and carry NO composition-id
+//     label — the composition is not labelled with its own id, it IS the id.
+//   - its CHILDREN's events carry LogAttributes['krateo.io/composition-id'],
+//     because the composition-dynamic-controller labels every resource it
+//     manages and the collector copies that label onto the event. A child's
+//     involvedObject.uid is its own, never the composition's.
+//
+// So the sets are disjoint by construction, and measured that way: over 2 days
+// on a live cluster the uid predicate matched 4,331 events across 39
+// compositions, the label predicate 827 across 8, and they OVERLAPPED ON 1 ROW.
+// Keying on either one alone is what made the composition detail page show a
+// composition's own reconcile churn with none of its workloads' events, or the
+// reverse — hence the union. The value is bound once and reused; it is never
+// interpolated.
+//
+// NOT covered, and not fixable here: Pods. The controller labels the Deployment,
+// not its pod template, so no Pod carries the label (0 of 156 on that cluster)
+// and Pod events — the largest single source — stay unattributed. That needs the
+// label propagated into pod templates, or the collector to walk ownerReferences.
+const compositionIDFilter = "\n  AND (JSONExtractString(Body, 'object', 'involvedObject', 'uid') = {composition_id:String}" +
+	"\n       OR LogAttributes['krateo.io/composition-id'] = {composition_id:String})"
 
 // namespaceFilter is the predicate appended when the caller is RBAC-scoped to
 // a set of namespaces (see rbac.go). The set is bound as a ClickHouse

@@ -259,3 +259,64 @@ func TestTokenFromRequestSSE_Precedence(t *testing.T) {
 		t.Errorf("expected no token, got (%q,%v)", tok, ok)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// buildEventsQuery — a composition's feed is its OWN events UNION its CHILDREN's
+//
+// Two mechanisms, two predicates: the composition CR's reconcile events carry
+// involvedObject.uid and no label; its managed resources carry the
+// krateo.io/composition-id label the composition-dynamic-controller stamps on
+// them. Measured near-disjoint (4,331 vs 827 rows, overlapping on 1), so
+// dropping either predicate silently halves the feed.
+// ---------------------------------------------------------------------------
+
+func TestBuildEventsQuery_CompositionIncludesOwnAndChildren(t *testing.T) {
+	cid := "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
+	q, params, err := buildEventsQuery(mustValues(t, "composition_id="+cid), nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// The composition's own reconcile events.
+	if !strings.Contains(q, "JSONExtractString(Body, 'object', 'involvedObject', 'uid') = {composition_id:String}") {
+		t.Errorf("query must still match the composition's OWN events:\n%s", q)
+	}
+	// Its managed children, via the controller-stamped label.
+	if !strings.Contains(q, "LogAttributes['krateo.io/composition-id'] = {composition_id:String}") {
+		t.Errorf("query must also match the composition's CHILDREN:\n%s", q)
+	}
+	// Union, not intersection — an AND here would return almost nothing, since a
+	// composition CR never carries its own composition-id label.
+	if !strings.Contains(q, "OR LogAttributes['krateo.io/composition-id']") {
+		t.Errorf("the two predicates must be OR'd, not AND'd:\n%s", q)
+	}
+	// One bound parameter serves both sides; the raw value is never inlined.
+	if params["composition_id"] != cid {
+		t.Errorf("composition_id param = %q, want %q", params["composition_id"], cid)
+	}
+	if strings.Contains(q, cid) {
+		t.Errorf("composition_id must NOT be interpolated into the SQL:\n%s", q)
+	}
+}
+
+func TestBuildEventsQuery_CompositionPredicateIsParenthesised(t *testing.T) {
+	// The composition predicate is OR'd internally and is appended alongside the
+	// RBAC namespace predicate, which is AND'd. Without the parentheses the OR
+	// would bind looser than the AND and the namespace scope would leak — a
+	// scoped caller would receive events from namespaces they cannot read.
+	cid := "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
+	scope := &nsScope{namespaces: []string{"team-a"}}
+	q, _, err := buildEventsQuery(mustValues(t, "composition_id="+cid), scope)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	open, closed := strings.Count(q, "("), strings.Count(q, ")")
+	if open != closed {
+		t.Errorf("unbalanced parentheses (%d open, %d close):\n%s", open, closed, q)
+	}
+	if !strings.Contains(q, "{composition_id:String})") {
+		t.Errorf("the OR'd composition predicate must be wrapped in its own parentheses:\n%s", q)
+	}
+	if !strings.Contains(q, "{namespaces:Array(String)}") {
+		t.Errorf("the namespace predicate must still be applied:\n%s", q)
+	}
+}
