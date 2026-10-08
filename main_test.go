@@ -320,3 +320,93 @@ func TestBuildEventsQuery_CompositionPredicateIsParenthesised(t *testing.T) {
 		t.Errorf("the namespace predicate must still be applied:\n%s", q)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// buildEventsQuery — the tokenbf_v1 pruning prefilter on Body
+// ---------------------------------------------------------------------------
+
+// TestBuildEventsQuery_TokenPrefilterIsBoundAndWholeToken pins the prefilter
+// that makes the composition predicate prunable. Without it the JSON predicate
+// forces a full scan of every k8s-events row (2.21M of 109.5M on krateo-057),
+// which is why this endpoint cost ~2s regardless of how many events it returned.
+func TestBuildEventsQuery_TokenPrefilterIsBoundAndWholeToken(t *testing.T) {
+	cid := "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
+	q, params, err := buildEventsQuery(mustValues(t, "composition_id="+cid), nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(q, "hasToken(Body, {composition_id_token:String})") {
+		t.Errorf("query must carry the hasToken prefilter, or the composition predicate cannot be "+
+			"pruned by idx_body and every k8s-events row is JSON-parsed:\n%s", q)
+	}
+	// The needle must be the FINAL segment: tokenbf_v1 splits on '-', and
+	// ClickHouse rejects a needle containing a separator, so passing the whole
+	// UUID would fail at query time rather than merely be slow.
+	want := "0016d3cca427"
+	if params["composition_id_token"] != want {
+		t.Errorf("composition_id_token = %q, want %q (the final UUID segment)",
+			params["composition_id_token"], want)
+	}
+	if strings.ContainsAny(params["composition_id_token"], "-_. ") {
+		t.Errorf("token needle %q contains a separator; hasToken would error at query time",
+			params["composition_id_token"])
+	}
+	if len(params["composition_id_token"]) != 12 {
+		t.Errorf("token needle %q has length %d, want 12 — uuidRe guarantees a 12-hex final segment, "+
+			"and a shorter needle would be a PREFIX of other tokens and prune less",
+			params["composition_id_token"], len(params["composition_id_token"]))
+	}
+	// Still bound, never interpolated.
+	if strings.Contains(q, want) {
+		t.Errorf("the token value must NOT be interpolated into the SQL:\n%s", q)
+	}
+	// The prefilter must NOT replace the exact predicate: it admits extra
+	// candidate rows (bloom false positives, and any row merely mentioning the
+	// segment), which only the exact conjunct rejects.
+	if !strings.Contains(q, "JSONExtractString(Body, 'object', 'involvedObject', 'uid') = {composition_id:String}") {
+		t.Errorf("the exact predicate must remain — the prefilter is for PRUNING, not semantics:\n%s", q)
+	}
+}
+
+// TestBuildEventsQuery_NoTokenParamWhenUnfiltered — an unbound parameter
+// referenced by the SQL is a query-time error, so the token must appear only
+// when the predicate that uses it does.
+func TestBuildEventsQuery_NoTokenParamWhenUnfiltered(t *testing.T) {
+	q, params, err := buildEventsQuery(url.Values{}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := params["composition_id_token"]; ok {
+		t.Errorf("composition_id_token must be absent when unfiltered, got %v", params)
+	}
+	if strings.Contains(q, "composition_id_token") {
+		t.Errorf("unfiltered query must not reference the token param:\n%s", q)
+	}
+}
+
+// TestBuildEventsQuery_TokenMatchesEveryUUIDCase guards the equivalence argument
+// across the shapes uuidRe admits: the final segment is a token of any Body that
+// contains the UUID, so the prefilter can never exclude a true match.
+func TestBuildEventsQuery_TokenMatchesEveryUUIDCase(t *testing.T) {
+	for _, cid := range []string{
+		"1b4e28ba-2fa1-11d2-883f-0016d3cca427",
+		"AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+		"00000000-0000-0000-0000-000000000000",
+		"ffffffff-ffff-ffff-ffff-ffffffffffff",
+	} {
+		_, params, err := buildEventsQuery(mustValues(t, "composition_id="+cid), nil)
+		if err != nil {
+			t.Fatalf("buildEventsQuery(%q): %v", cid, err)
+		}
+		tok := params["composition_id_token"]
+		if !strings.HasSuffix(cid, tok) || len(tok) != 12 {
+			t.Errorf("cid %q -> token %q: must be the 12-char final segment", cid, tok)
+		}
+		// The whole point: a Body containing the UUID contains this token.
+		body := `{"object":{"involvedObject":{"uid":"` + cid + `"}}}`
+		if !strings.Contains(body, tok) {
+			t.Errorf("token %q is not present in a Body carrying uid %q — the prefilter would "+
+				"exclude a true match", tok, cid)
+		}
+	}
+}
