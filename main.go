@@ -474,6 +474,33 @@ ORDER BY Timestamp DESC
 LIMIT {limit:UInt32}
 FORMAT JSONEachRow`
 
+// THE FIRST CONJUNCT IS A PRUNING PREFILTER, NOT A SEMANTIC FILTER. It exists
+// because the second conjunct cannot use any index: JSONExtractString(Body, ...)
+// is a computed expression over a non-indexed column, so every row surviving the
+// telemetry.source predicate (2.21M of otel_logs' 109.5M on krateo-057) was being
+// JSON-parsed. That is why this endpoint cost ~2s REGARDLESS of result size — a
+// filter matching nothing was the slowest case of all, because nothing could
+// terminate the scan early.
+//
+// otel_logs carries `INDEX idx_body Body TYPE tokenbf_v1(...)`, so hasToken IS
+// prunable. The full UUID cannot be used as a needle (tokenbf splits on '-', and
+// ClickHouse rejects a needle containing a separator), but uuidRe guarantees the
+// shape 8-4-4-4-12, so the FINAL segment is always exactly 12 hex characters —
+// one whole token, never a prefix of another.
+//
+// WHY IT IS SAFE. Writing M for the map equality, J for the JSON equality and T
+// for hasToken, the predicate goes from (J OR M) to (T OR M) AND (J OR M):
+//   - M true           -> both conjuncts true; included, as before.
+//   - M false, J true  -> the uid is a substring of Body, so its final segment is
+//     necessarily a token of Body, so T is true; included.
+//   - M false, J false -> second conjunct false; excluded, as before.
+//
+// So the result set is unchanged; T can only ever admit extra candidate rows that
+// the exact conjunct then rejects. The bloom filter's false positives are
+// likewise safe — a bloom never reports a false NEGATIVE, so no granule holding a
+// match is skipped. Verified against the live 057 dataset: identical row counts
+// on a uid with events and on one with none, 1.5-1.9x faster in both.
+//
 // compositionIDFilter selects a composition's events — BOTH the events on the
 // composition CR itself AND the events on the resources it manages. Those are
 // two different predicates because they are two different mechanisms, and each
@@ -499,7 +526,9 @@ FORMAT JSONEachRow`
 // not its pod template, so no Pod carries the label (0 of 156 on that cluster)
 // and Pod events — the largest single source — stay unattributed. That needs the
 // label propagated into pod templates, or the collector to walk ownerReferences.
-const compositionIDFilter = "\n  AND (JSONExtractString(Body, 'object', 'involvedObject', 'uid') = {composition_id:String}" +
+const compositionIDFilter = "\n  AND (hasToken(Body, {composition_id_token:String})" +
+	"\n       OR LogAttributes['krateo.io/composition-id'] = {composition_id:String})" +
+	"\n  AND (JSONExtractString(Body, 'object', 'involvedObject', 'uid') = {composition_id:String}" +
 	"\n       OR LogAttributes['krateo.io/composition-id'] = {composition_id:String})"
 
 // namespaceFilter is the predicate appended when the caller is RBAC-scoped to
@@ -549,6 +578,10 @@ func buildEventsQuery(q url.Values, scope *nsScope) (string, map[string]string, 
 		}
 		predicate = compositionIDFilter
 		params["composition_id"] = cid
+		// The final UUID segment: a whole token for the tokenbf_v1 index on Body.
+		// uuidRe has already guaranteed the 8-4-4-4-12 shape, so this is always
+		// exactly 12 hex characters and never contains a separator.
+		params["composition_id_token"] = cid[strings.LastIndexByte(cid, '-')+1:]
 	}
 
 	nsPredicate := ""
