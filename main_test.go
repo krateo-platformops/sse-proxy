@@ -74,7 +74,7 @@ func TestBuildEventsQuery_WithValidComposition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(q, "JSONExtractString(Body, 'object', 'involvedObject', 'uid') = {composition_id:String}") {
+	if !strings.Contains(q, "LogAttributes['krateo.io/composition-id'] = {composition_id:String}") {
 		t.Errorf("query must contain the bound composition predicate:\n%s", q)
 	}
 	if params["composition_id"] != cid {
@@ -270,26 +270,23 @@ func TestTokenFromRequestSSE_Precedence(t *testing.T) {
 // dropping either predicate silently halves the feed.
 // ---------------------------------------------------------------------------
 
+// TestBuildEventsQuery_CompositionIncludesOwnAndChildren — one attribute now
+// carries BOTH halves of a composition's feed, so one predicate suffices.
+// Children get krateo.io/composition-id from the controller's label; the
+// composition's OWN reconcile events get it because otel-collector#11 returns a
+// root composition's own metadata.uid as the composition-id. Measured on
+// krateo-057: 1,612 of devday-milan's 1,613 own events carried the label.
+// If that regresses, this endpoint silently serves half a feed.
 func TestBuildEventsQuery_CompositionIncludesOwnAndChildren(t *testing.T) {
 	cid := "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
 	q, params, err := buildEventsQuery(mustValues(t, "composition_id="+cid), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// The composition's own reconcile events.
-	if !strings.Contains(q, "JSONExtractString(Body, 'object', 'involvedObject', 'uid') = {composition_id:String}") {
-		t.Errorf("query must still match the composition's OWN events:\n%s", q)
-	}
-	// Its managed children, via the controller-stamped label.
 	if !strings.Contains(q, "LogAttributes['krateo.io/composition-id'] = {composition_id:String}") {
-		t.Errorf("query must also match the composition's CHILDREN:\n%s", q)
+		t.Errorf("query must match on the composition-id label, which covers own events AND children:\n%s", q)
 	}
-	// Union, not intersection — an AND here would return almost nothing, since a
-	// composition CR never carries its own composition-id label.
-	if !strings.Contains(q, "OR LogAttributes['krateo.io/composition-id']") {
-		t.Errorf("the two predicates must be OR'd, not AND'd:\n%s", q)
-	}
-	// One bound parameter serves both sides; the raw value is never inlined.
+	// One bound parameter; the raw value is never inlined.
 	if params["composition_id"] != cid {
 		t.Errorf("composition_id param = %q, want %q", params["composition_id"], cid)
 	}
@@ -298,115 +295,100 @@ func TestBuildEventsQuery_CompositionIncludesOwnAndChildren(t *testing.T) {
 	}
 }
 
-func TestBuildEventsQuery_CompositionPredicateIsParenthesised(t *testing.T) {
-	// The composition predicate is OR'd internally and is appended alongside the
-	// RBAC namespace predicate, which is AND'd. Without the parentheses the OR
-	// would bind looser than the AND and the namespace scope would leak — a
-	// scoped caller would receive events from namespaces they cannot read.
+// TestBuildEventsQuery_ScopeCannotLeakThroughPrecedence guards an RBAC leak.
+// The composition predicate is appended alongside the namespace predicate, which
+// is AND'd. While the composition predicate was an OR'd pair it NEEDED its own
+// parentheses — without them the OR binds looser than the AND and a scoped caller
+// receives events from namespaces they cannot read. It is now a single equality,
+// so there is no OR to bind loosely and the hazard is gone by construction. This
+// test keeps that property pinned: if anyone reintroduces a top-level OR into the
+// composition predicate, it must be parenthesised.
+func TestBuildEventsQuery_ScopeCannotLeakThroughPrecedence(t *testing.T) {
 	cid := "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
 	scope := &nsScope{namespaces: []string{"team-a"}}
 	q, _, err := buildEventsQuery(mustValues(t, "composition_id="+cid), scope)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	open, closed := strings.Count(q, "("), strings.Count(q, ")")
-	if open != closed {
+	if open, closed := strings.Count(q, "("), strings.Count(q, ")"); open != closed {
 		t.Errorf("unbalanced parentheses (%d open, %d close):\n%s", open, closed, q)
-	}
-	if !strings.Contains(q, "{composition_id:String})") {
-		t.Errorf("the OR'd composition predicate must be wrapped in its own parentheses:\n%s", q)
 	}
 	if !strings.Contains(q, "{namespaces:Array(String)}") {
 		t.Errorf("the namespace predicate must still be applied:\n%s", q)
 	}
+	// Isolate the appended predicates and reject any UNPARENTHESISED top-level OR.
+	marker := "JSONExtractString(Body, 'object', 'reason') != ''"
+	tail := q[strings.Index(q, marker)+len(marker):]
+	for _, line := range strings.Split(tail, "\n") {
+		t2 := strings.TrimSpace(line)
+		if !strings.HasPrefix(t2, "AND ") {
+			continue
+		}
+		clause := strings.TrimPrefix(t2, "AND ")
+		if strings.Contains(clause, " OR ") && !strings.HasPrefix(clause, "(") {
+			t.Errorf("top-level OR in an AND'd clause must be parenthesised or the namespace "+
+				"scope leaks: %q", clause)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
-// buildEventsQuery — the tokenbf_v1 pruning prefilter on Body
+// buildEventsQuery — the composition predicate is ONE indexed map lookup
 // ---------------------------------------------------------------------------
 
-// TestBuildEventsQuery_TokenPrefilterIsBoundAndWholeToken pins the prefilter
-// that makes the composition predicate prunable. Without it the JSON predicate
-// forces a full scan of every k8s-events row (2.21M of 109.5M on krateo-057),
-// which is why this endpoint cost ~2s regardless of how many events it returned.
-func TestBuildEventsQuery_TokenPrefilterIsBoundAndWholeToken(t *testing.T) {
+// TestBuildEventsQuery_CompositionPredicateIsMapOnly pins the property the whole
+// fix rests on: NOTHING in the composition predicate may touch Body. Any
+// JSONExtractString or hasToken over Body is a computed expression on a
+// non-indexed column, which cannot prune and restores the ~2s-regardless-of-
+// result-size behaviour this replaced (measured 18.49s for a composition with no
+// events, against 0.42s map-only).
+func TestBuildEventsQuery_CompositionPredicateIsMapOnly(t *testing.T) {
 	cid := "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
 	q, params, err := buildEventsQuery(mustValues(t, "composition_id="+cid), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(q, "hasToken(Body, {composition_id_token:String})") {
-		t.Errorf("query must carry the hasToken prefilter, or the composition predicate cannot be "+
-			"pruned by idx_body and every k8s-events row is JSON-parsed:\n%s", q)
+	if !strings.Contains(q, "LogAttributes['krateo.io/composition-id'] = {composition_id:String}") {
+		t.Errorf("composition predicate must be the indexed map lookup:\n%s", q)
 	}
-	// The needle must be the FINAL segment: tokenbf_v1 splits on '-', and
-	// ClickHouse rejects a needle containing a separator, so passing the whole
-	// UUID would fail at query time rather than merely be slow.
-	want := "0016d3cca427"
-	if params["composition_id_token"] != want {
-		t.Errorf("composition_id_token = %q, want %q (the final UUID segment)",
-			params["composition_id_token"], want)
+	// Extract just the appended predicate: everything after the sanity clause.
+	marker := "JSONExtractString(Body, 'object', 'reason') != ''"
+	idx := strings.Index(q, marker)
+	if idx < 0 {
+		t.Fatalf("sanity predicate missing from template:\n%s", q)
 	}
-	if strings.ContainsAny(params["composition_id_token"], "-_. ") {
-		t.Errorf("token needle %q contains a separator; hasToken would error at query time",
-			params["composition_id_token"])
+	predicate := q[idx+len(marker):]
+	for _, banned := range []string{"involvedObject", "hasToken", "composition_id_token"} {
+		if strings.Contains(predicate, banned) {
+			t.Errorf("composition predicate must not reference %q — it would defeat idx_log_attr_value "+
+				"pruning and reintroduce a full scan:\n%s", banned, predicate)
+		}
 	}
-	if len(params["composition_id_token"]) != 12 {
-		t.Errorf("token needle %q has length %d, want 12 — uuidRe guarantees a 12-hex final segment, "+
-			"and a shorter needle would be a PREFIX of other tokens and prune less",
-			params["composition_id_token"], len(params["composition_id_token"]))
+	if params["composition_id"] != cid {
+		t.Errorf("composition_id param = %q, want %q", params["composition_id"], cid)
 	}
-	// Still bound, never interpolated.
-	if strings.Contains(q, want) {
-		t.Errorf("the token value must NOT be interpolated into the SQL:\n%s", q)
-	}
-	// The prefilter must NOT replace the exact predicate: it admits extra
-	// candidate rows (bloom false positives, and any row merely mentioning the
-	// segment), which only the exact conjunct rejects.
-	if !strings.Contains(q, "JSONExtractString(Body, 'object', 'involvedObject', 'uid') = {composition_id:String}") {
-		t.Errorf("the exact predicate must remain — the prefilter is for PRUNING, not semantics:\n%s", q)
+	if strings.Contains(q, cid) {
+		t.Errorf("composition_id must NOT be interpolated into the SQL:\n%s", q)
 	}
 }
 
-// TestBuildEventsQuery_NoTokenParamWhenUnfiltered — an unbound parameter
-// referenced by the SQL is a query-time error, so the token must appear only
-// when the predicate that uses it does.
-func TestBuildEventsQuery_NoTokenParamWhenUnfiltered(t *testing.T) {
-	q, params, err := buildEventsQuery(url.Values{}, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if _, ok := params["composition_id_token"]; ok {
-		t.Errorf("composition_id_token must be absent when unfiltered, got %v", params)
-	}
-	if strings.Contains(q, "composition_id_token") {
-		t.Errorf("unfiltered query must not reference the token param:\n%s", q)
-	}
-}
-
-// TestBuildEventsQuery_TokenMatchesEveryUUIDCase guards the equivalence argument
-// across the shapes uuidRe admits: the final segment is a token of any Body that
-// contains the UUID, so the prefilter can never exclude a true match.
-func TestBuildEventsQuery_TokenMatchesEveryUUIDCase(t *testing.T) {
-	for _, cid := range []string{
-		"1b4e28ba-2fa1-11d2-883f-0016d3cca427",
-		"AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
-		"00000000-0000-0000-0000-000000000000",
-		"ffffffff-ffff-ffff-ffff-ffffffffffff",
+// TestBuildEventsQuery_NoStaleTokenParam — #21's prefilter bound a
+// composition_id_token param. The predicate no longer references it, and a
+// parameter bound but unused is dead weight that invites the predicate back.
+func TestBuildEventsQuery_NoStaleTokenParam(t *testing.T) {
+	for _, q := range []url.Values{
+		url.Values{},
+		mustValues(t, "composition_id=1b4e28ba-2fa1-11d2-883f-0016d3cca427"),
 	} {
-		_, params, err := buildEventsQuery(mustValues(t, "composition_id="+cid), nil)
+		sql, params, err := buildEventsQuery(q, nil)
 		if err != nil {
-			t.Fatalf("buildEventsQuery(%q): %v", cid, err)
+			t.Fatalf("unexpected error: %v", err)
 		}
-		tok := params["composition_id_token"]
-		if !strings.HasSuffix(cid, tok) || len(tok) != 12 {
-			t.Errorf("cid %q -> token %q: must be the 12-char final segment", cid, tok)
+		if _, ok := params["composition_id_token"]; ok {
+			t.Errorf("composition_id_token must no longer be bound, got %v", params)
 		}
-		// The whole point: a Body containing the UUID contains this token.
-		body := `{"object":{"involvedObject":{"uid":"` + cid + `"}}}`
-		if !strings.Contains(body, tok) {
-			t.Errorf("token %q is not present in a Body carrying uid %q — the prefilter would "+
-				"exclude a true match", tok, cid)
+		if strings.Contains(sql, "composition_id_token") {
+			t.Errorf("SQL must not reference the retired token param:\n%s", sql)
 		}
 	}
 }
