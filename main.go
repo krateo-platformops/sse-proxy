@@ -239,6 +239,15 @@ func getEnv(key, fallback string) string {
 // ---------------------------------------------------------------------------
 
 // pollSQL fetches K8s events from otel_logs that arrived after lastSeenUnix.
+//
+// The cursor predicate MUST compare the bare Timestamp column (sse-proxy#25).
+// It used to be `toUnixTimestamp(Timestamp) > lastSeenUnix`: a function over
+// the column defeats every index, so each 3s poll scanned ALL k8s-events rows
+// (measured on krateo-057: 730 granules / ~4.25M rows per poll, 828 polls an
+// hour, ~3.25 of ClickHouse's 4-core limit). `Timestamp >= lastSeenUnix+1`
+// selects exactly the same rows (toUnixTimestamp truncates to the second, so
+// toUnixTimestamp(ts) > N  <=>  ts >= N+1) and prunes to the newest granule
+// (EXPLAIN indexes=1: 1 part / 1 granule). poll() passes lastSeenUnix+1.
 // Events are stored as raw JSON in Body by the k8sobjects receiver.
 // The compositionresolver processor enriches LogAttributes with krateo.io/composition-id.
 // %%Y, %%m etc. become %Y, %m after fmt.Sprintf substitutes %d for the timestamp.
@@ -262,7 +271,7 @@ const pollSQL = `SELECT
 FROM otel_logs
 WHERE ResourceAttributes['telemetry.source'] = 'k8s-events'
   AND JSONExtractString(Body, 'object', 'reason') != ''
-  AND toUnixTimestamp(Timestamp) > %d
+  AND Timestamp >= toDateTime64(%d, 9)
 ORDER BY Timestamp ASC
 LIMIT 500
 FORMAT JSONEachRow`
@@ -304,7 +313,7 @@ func (p *poller) run(ctx context.Context) {
 }
 
 func (p *poller) poll(ctx context.Context) {
-	query := fmt.Sprintf(pollSQL, p.lastSeenUnix)
+	query := fmt.Sprintf(pollSQL, p.lastSeenUnix+1)
 	rows, err := queryClickHouse(ctx, p.client, p.cfg, query, nil)
 	if err != nil {
 		p.metrics.incPollError(ctx)
@@ -469,7 +478,7 @@ const eventsSQLTemplate = `SELECT
     ifNull(JSONExtractString(Body, 'object', 'source', 'component'), '')            AS source_component
 FROM otel_logs
 WHERE ResourceAttributes['telemetry.source'] = 'k8s-events'
-  AND JSONExtractString(Body, 'object', 'reason') != ''/*COMPOSITION_PREDICATE*//*NAMESPACE_PREDICATE*/
+  AND JSONExtractString(Body, 'object', 'reason') != ''/*COMPOSITION_PREDICATE*//*NAMESPACE_PREDICATE*//*WINDOW_PREDICATE*/
 ORDER BY Timestamp DESC
 LIMIT {limit:UInt32}
 FORMAT JSONEachRow`
@@ -523,6 +532,28 @@ const compositionIDFilter = "\n  AND LogAttributes['krateo.io/composition-id'] =
 // construction — ” is never in the allowed set.
 const namespaceFilter = "\n  AND JSONExtractString(Body, 'object', 'involvedObject', 'namespace') IN {namespaces:Array(String)}"
 
+// windowPredicatePlaceholder is replaced with either an empty string (the
+// unbounded, last-resort query) or windowFilter.
+const windowPredicatePlaceholder = "/*WINDOW_PREDICATE*/"
+
+// windowFilter bounds an /events query to rows at or after {since} (unix
+// seconds). It compares the BARE Timestamp column so the primary key prunes
+// (sse-proxy#25); a function over the column would scan every granule again.
+const windowFilter = "\n  AND Timestamp >= toDateTime64({since:Int64}, 9)"
+
+// eventsWindows are the newest-first windows /events tries before falling
+// back to the unbounded query (0). WHY THE RESULT IS IDENTICAL to the
+// unbounded query: the query is `ORDER BY Timestamp DESC LIMIT n`. When a
+// window [since, now] already holds n rows, every row outside it is strictly
+// older than every row inside it, so none of them can enter the top n — the
+// window's answer IS the unbounded answer. A window holding fewer than n rows
+// proves nothing, so the next (wider) window runs; the last step is always
+// unbounded, so a sparse composition (0–2 events, the common case) still gets
+// every event otel_logs retains. No event a caller would have received is
+// ever dropped; only the scan shrinks (devday-milan on krateo-057: 528
+// granules unbounded vs 4 for the last hour).
+var eventsWindows = []time.Duration{time.Hour, 24 * time.Hour, 0}
+
 // uuidRe matches an RFC 4122 UUID (the shape of a krateo composition id),
 // case-insensitively. Used to reject anything that is not a UUID before the
 // value is bound as a ClickHouse parameter (defence in depth).
@@ -551,6 +582,12 @@ func parseLimit(raw string) int {
 // (which cannot happen for names obtained from the K8s API — defence in
 // depth). limit is always clamped to a safe range.
 func buildEventsQuery(q url.Values, scope *nsScope) (string, map[string]string, error) {
+	return buildEventsQueryWindow(q, scope, 0)
+}
+
+// buildEventsQueryWindow is buildEventsQuery bounded to rows at or after
+// since (unix seconds); since <= 0 means unbounded.
+func buildEventsQueryWindow(q url.Values, scope *nsScope, since int64) (string, map[string]string, error) {
 	params := map[string]string{
 		"limit": strconv.Itoa(parseLimit(q.Get("limit"))),
 	}
@@ -576,7 +613,41 @@ func buildEventsQuery(q url.Values, scope *nsScope) (string, map[string]string, 
 
 	query := strings.Replace(eventsSQLTemplate, compositionPredicatePlaceholder, predicate, 1)
 	query = strings.Replace(query, namespacePredicatePlaceholder, nsPredicate, 1)
+
+	windowPredicate := ""
+	if since > 0 {
+		windowPredicate = windowFilter
+		params["since"] = strconv.FormatInt(since, 10)
+	}
+	query = strings.Replace(query, windowPredicatePlaceholder, windowPredicate, 1)
 	return query, params, nil
+}
+
+// queryEventsWindowed runs the /events query newest-window-first (see
+// eventsWindows) and returns the first answer that is provably identical to
+// the unbounded one: a window that filled the limit, or the unbounded query.
+func queryEventsWindowed(ctx context.Context, client *http.Client, cfg config, q url.Values, scope *nsScope, now time.Time) ([]chRow, error) {
+	limit := parseLimit(q.Get("limit"))
+	for _, w := range eventsWindows {
+		var since int64
+		if w > 0 {
+			since = now.Add(-w).Unix()
+		}
+		query, params, err := buildEventsQueryWindow(q, scope, since)
+		if err != nil {
+			return nil, err
+		}
+		rows, err := queryClickHouse(ctx, client, cfg, query, params)
+		if err != nil {
+			return nil, err
+		}
+		if w == 0 || len(rows) >= limit {
+			return rows, nil
+		}
+	}
+	// Unreachable while eventsWindows ends with 0; fail loudly rather than
+	// return a bounded (possibly incomplete) answer.
+	return nil, fmt.Errorf("eventsWindows must end with the unbounded window (0)")
 }
 
 // resolveRequestScope derives the caller's namespace scope from the verified
@@ -616,13 +687,14 @@ func handleEvents(cfg config, client *http.Client, scoper *rbacScoper) http.Hand
 			return
 		}
 
-		query, params, err := buildEventsQuery(r.URL.Query(), scope)
-		if err != nil {
+		// Validate the request (400 on a bad composition_id) before any
+		// ClickHouse work; the windowed runner rebuilds per window.
+		if _, _, err := buildEventsQuery(r.URL.Query(), scope); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		rows, err := queryClickHouse(ctx, client, cfg, query, params)
+		rows, err := queryEventsWindowed(ctx, client, cfg, r.URL.Query(), scope, time.Now())
 		if err != nil {
 			slogErrorCtx(ctx, "events", "clickhouse query failed", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
