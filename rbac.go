@@ -116,6 +116,44 @@ func (s *nsScope) allows(ns string) bool {
 	return false
 }
 
+// scopeHeaderName announces the caller's resolved scope at CONNECT time, so a browser can
+// tell a legitimately-narrow bell from a broken one BEFORE any frame arrives.
+//
+// WHY A HEADER AND NOT A FIRST EVENT. It is readable at open time, so the portal renders
+// the right empty state on first paint instead of after a silence it cannot interpret.
+// This is only possible because the portal moved to fetch-SSE (installer#395): EventSource
+// cannot read response headers at all. A second dividend of taking the token out of the URL.
+const scopeHeaderName = "X-Krateo-Event-Scope"
+
+// scopeHeaderValue reports the header value and whether to send the header at all.
+//
+//	nil scope   -> ("", false)   scoping DISABLED: send NO header
+//	allowAll    -> ("*", true)
+//	empty set   -> ("none", true)
+//	otherwise   -> ("ns-a,ns-b", true)
+//
+// `none` IS AN EXPLICIT TOKEN, NOT AN EMPTY VALUE. An absent header means "this proxy does
+// not scope" and an empty scope means "you may see nothing" — opposite meanings, and an
+// empty header value is too easily confused with absence by anything that strips empty
+// headers in between. A consumer treating a missing header as unscoped is then correct for
+// an old proxy and correct for a disabled one.
+//
+// The list needs no sorting here: nsScope.namespaces is already sorted and deduplicated
+// (see the field comment and the sort in resolve), so the value is stable across reconnects
+// and a consumer cannot mistake a reshuffle for a change of scope.
+func (s *nsScope) scopeHeaderValue() (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	if s.allowAll {
+		return "*", true
+	}
+	if len(s.namespaces) == 0 {
+		return "none", true
+	}
+	return strings.Join(s.namespaces, ","), true
+}
+
 // restricted reports whether a namespace predicate must be enforced.
 func (s *nsScope) restricted() bool { return s != nil && !s.allowAll }
 

@@ -767,6 +767,18 @@ func handleSSE(h *hub, scoper *rbacScoper) http.HandlerFunc {
 			return
 		}
 
+		// Announce the resolved scope BEFORE the stream opens. Absent header => this proxy
+		// does not scope; see scopeHeaderValue.
+		if v, ok := scope.scopeHeaderValue(); ok {
+			w.Header().Set(scopeHeaderName, v)
+			// Access-Control-Allow-Origin below is "*", i.e. cross-origin use is expected —
+			// and a cross-origin `fetch` CANNOT READ a custom response header unless the
+			// server also exposes it. Omitting this would leave the header present on the
+			// wire, invisible to the only consumer that wants it, and the failure would look
+			// like the portal ignoring it.
+			w.Header().Set("Access-Control-Expose-Headers", scopeHeaderName)
+		}
+
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
