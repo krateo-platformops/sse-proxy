@@ -392,3 +392,53 @@ func TestResolveRequestScope_UsesContextIdentity(t *testing.T) {
 		t.Fatalf("scope = %+v, want alice scoped to team-a", scope)
 	}
 }
+
+// TestScopeHeaderValue pins the four-way contract agreed with the portal
+// (sse-proxy#29): absent / "*" / "none" / an explicit sorted list.
+//
+// The ABSENT and "none" cases are the pair that matters: absent means "this proxy does not
+// scope" and "none" means "you may see nothing". Collapsing either into an empty string
+// would make an old proxy indistinguishable from a caller with no namespaces, which is the
+// opposite conclusion.
+func TestScopeHeaderValue(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		scope *nsScope
+		want  string
+		send  bool
+	}{
+		{"scoping disabled sends no header", nil, "", false},
+		{"allowAll", &nsScope{allowAll: true}, "*", true},
+		{"empty scope is an explicit token, not an empty value", &nsScope{}, "none", true},
+		{"single namespace", &nsScope{namespaces: []string{"demo-system"}}, "demo-system", true},
+		{"several, already sorted", &nsScope{namespaces: []string{"demo-system", "team-a"}}, "demo-system,team-a", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, send := tc.scope.scopeHeaderValue()
+			if send != tc.send {
+				t.Fatalf("send = %v, want %v", send, tc.send)
+			}
+			if got != tc.want {
+				t.Errorf("value = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestScopeHeaderEmptyIsDistinctFromAbsent is the assertion the contract turns on, stated
+// on its own so a refactor that returns ("", true) for an empty scope fails loudly rather
+// than passing the table above by accident.
+func TestScopeHeaderEmptyIsDistinctFromAbsent(t *testing.T) {
+	absentV, absentSend := (*nsScope)(nil).scopeHeaderValue()
+	emptyV, emptySend := (&nsScope{}).scopeHeaderValue()
+
+	if absentSend {
+		t.Error("a nil scope must send NO header: absent means 'this proxy does not scope'")
+	}
+	if !emptySend {
+		t.Error("an empty scope must SEND a header: silence is indistinguishable from a healthy quiet bell")
+	}
+	if emptyV == absentV {
+		t.Errorf("empty and absent must differ, got both %q — they mean opposite things", emptyV)
+	}
+}
