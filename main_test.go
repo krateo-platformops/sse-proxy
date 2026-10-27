@@ -392,3 +392,56 @@ func TestBuildEventsQuery_NoStaleTokenParam(t *testing.T) {
 		}
 	}
 }
+
+// TestBroadcastReportsDropsWhenTheBufferIsFull is the assertion frontend asked for on
+// sse-proxy#29 and #30: a drop counter that exists but never moves is indistinguishable
+// from a system that never drops. So this provokes a real drop and asserts the NUMBER
+// CHANGES, not merely that the field is present.
+//
+// It also pins the direction that matters: a full client must not stall the others.
+func TestBroadcastReportsDropsWhenTheBufferIsFull(t *testing.T) {
+	h := newHub()
+	// Capacity 2 so the third send has nowhere to go. Nothing reads from it, which is the
+	// real shape: during a backlog drain the producer loop outruns the HTTP writer.
+	full := &client{ch: make(chan sseMessage, 2), topic: ""}
+	roomy := &client{ch: make(chan sseMessage, 16), topic: ""}
+	h.register(full)
+	h.register(roomy)
+
+	var sent, dropped int64
+	for i := 0; i < 5; i++ {
+		s, d := h.broadcast(sseMessage{topic: "krateo", data: []byte("e")})
+		sent += s
+		dropped += d
+	}
+
+	// 5 messages x 2 clients = 10 attempts. The roomy client takes all 5; the full one
+	// takes 2 and drops 3.
+	if sent != 7 {
+		t.Errorf("sent = %d, want 7 (5 roomy + 2 full)", sent)
+	}
+	if dropped != 3 {
+		t.Errorf("dropped = %d, want 3 — a drop counter that never moves proves nothing", dropped)
+	}
+	if got := len(roomy.ch); got != 5 {
+		t.Errorf("the roomy client got %d of 5: a full peer must not stall the fan-out", got)
+	}
+}
+
+// TestBroadcastReportsZeroDropsWhenEveryoneKeepsUp is the negative arm. Without it the
+// test above passes against an implementation that reports a constant 3.
+func TestBroadcastReportsZeroDropsWhenEveryoneKeepsUp(t *testing.T) {
+	h := newHub()
+	c := &client{ch: make(chan sseMessage, 8), topic: ""}
+	h.register(c)
+
+	var sent, dropped int64
+	for i := 0; i < 4; i++ {
+		s, d := h.broadcast(sseMessage{topic: "krateo", data: []byte("e")})
+		sent += s
+		dropped += d
+	}
+	if sent != 4 || dropped != 0 {
+		t.Errorf("sent/dropped = %d/%d, want 4/0", sent, dropped)
+	}
+}

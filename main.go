@@ -186,7 +186,20 @@ func (h *hub) unregister(c *client) {
 	close(c.ch)
 }
 
-func (h *hub) broadcast(msg sseMessage) {
+// broadcast fans msg out to every client that wants it and reports (sent, dropped).
+//
+// IT RETURNS COUNTS RATHER THAN RECORDING THEM so the hub keeps no metrics dependency:
+// the caller (poll) already holds one, and a hub that reaches for a meter is harder to
+// test than one that returns numbers.
+//
+// WHY THE DROPPED COUNT MATTERS. The send is deliberately non-blocking — a slow client
+// must not stall the fan-out — so an overflowing 64-slot channel silently discards. The
+// poll cursor then advances past those rows regardless (see poll), so they are lost
+// permanently rather than delayed. That combination was entered 56 times in one morning
+// on krateo-057, in bursts of 500 rows per 3s poll after an idle period, and NOTHING
+// could say how much was lost: `delivered` was incremented after the send, so it counted
+// ATTEMPTS. See sse-proxy#30.
+func (h *hub) broadcast(msg sseMessage) (sent, dropped int64) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for c := range h.clients {
@@ -196,9 +209,12 @@ func (h *hub) broadcast(msg sseMessage) {
 		// Non-blocking send: drop the message for slow clients rather than blocking.
 		select {
 		case c.ch <- msg:
+			sent++
 		default:
+			dropped++
 		}
 	}
+	return sent, dropped
 }
 
 func (h *hub) count() int {
@@ -322,7 +338,10 @@ func (p *poller) poll(ctx context.Context) {
 	}
 
 	maxTs := p.lastSeenUnix
-	var delivered int64
+	// delivered counts SENDS THAT LANDED, not attempts. It used to be incremented once per
+	// row after the broadcast, which made it agree with itself whether or not anything
+	// reached a client (sse-proxy#30).
+	var delivered, dropped int64
 	for _, row := range rows {
 		if row.TsUnix > maxTs {
 			maxTs = row.TsUnix
@@ -338,13 +357,16 @@ func (p *poller) poll(ctx context.Context) {
 		// Global topic — mirrors eventsse behaviour where all events
 		// are published under the "krateo" topic. The event's namespace rides
 		// along so the hub can enforce per-client RBAC scoping at fan-out.
-		p.hub.broadcast(sseMessage{topic: "krateo", data: data, namespace: row.ObjNamespace})
-		delivered++
+		s, d := p.hub.broadcast(sseMessage{topic: "krateo", data: data, namespace: row.ObjNamespace})
+		delivered += s
+		dropped += d
 
 		// Composition-specific topic so per-composition listeners
 		// only receive their own events.
 		if row.CompositionID != "" {
-			p.hub.broadcast(sseMessage{topic: row.CompositionID, data: data, namespace: row.ObjNamespace})
+			s, d := p.hub.broadcast(sseMessage{topic: row.CompositionID, data: data, namespace: row.ObjNamespace})
+			delivered += s
+			dropped += d
 		}
 	}
 
@@ -353,8 +375,16 @@ func (p *poller) poll(ctx context.Context) {
 	}
 	if len(rows) > 0 {
 		p.metrics.addEventsDelivered(ctx, delivered)
+		// Recorded unconditionally, including zero: a dropped counter that only appears
+		// once something is lost cannot be distinguished from one that was never wired.
+		p.metrics.addEventsDropped(ctx, dropped)
 		slogInfoCtx(ctx, "poller", "broadcasted events",
 			slog.Int("count", len(rows)),
+			slog.Int64("delivered", delivered),
+			// On the log line too, because OTel export is DEFAULT-OFF: a counter nobody
+			// exports is unreadable, and this is the one number an operator needs during
+			// the burst rather than afterwards.
+			slog.Int64("dropped", dropped),
 			slog.Int64("last_seen", p.lastSeenUnix),
 		)
 	}
