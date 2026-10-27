@@ -25,6 +25,7 @@ const meterName = "github.com/krateo-platformops/sse-proxy"
 
 type proxyMetrics struct {
 	eventsDelivered metric.Int64Counter
+	eventsDropped   metric.Int64Counter
 	pollErrors      metric.Int64Counter
 }
 
@@ -37,6 +38,16 @@ func initMetrics(h *hub) (*proxyMetrics, error) {
 	eventsDelivered, err := meter.Int64Counter(
 		"sse_proxy_events_delivered_total",
 		metric.WithDescription("Total SSE events broadcast to connected clients."),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	eventsDropped, err := meter.Int64Counter(
+		"sse_proxy_events_dropped_total",
+		metric.WithDescription(
+			"Total SSE events DISCARDED because a client's buffer was full. These are lost "+
+				"permanently, not delayed: the poll cursor advances past them regardless."),
 	)
 	if err != nil {
 		return nil, err
@@ -71,6 +82,7 @@ func initMetrics(h *hub) (*proxyMetrics, error) {
 
 	return &proxyMetrics{
 		eventsDelivered: eventsDelivered,
+		eventsDropped:   eventsDropped,
 		pollErrors:      pollErrors,
 	}, nil
 }
@@ -81,6 +93,16 @@ func (m *proxyMetrics) addEventsDelivered(ctx context.Context, n int64) {
 		return
 	}
 	m.eventsDelivered.Add(ctx, n)
+}
+
+// addEventsDropped records n SSE events discarded because a client's buffer was full.
+// Nil-safe, and called with 0 as well: a counter that only materialises once something is
+// lost is indistinguishable from one that was never wired.
+func (m *proxyMetrics) addEventsDropped(ctx context.Context, n int64) {
+	if m == nil {
+		return
+	}
+	m.eventsDropped.Add(ctx, n)
 }
 
 // incPollError records a single poll error. Nil-safe.
