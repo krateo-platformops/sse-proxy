@@ -1,0 +1,87 @@
+name: test
+
+# Runs this repo's Go tests. Until now NOTHING did (sse-proxy#28): the workflows were
+# release-notes, release-tag and security, and none of them invokes `go test`. Four test
+# files — auth_test.go, events_window_test.go, main_test.go, rbac_test.go — have been in
+# the tree and unrun.
+#
+# WHY IT MATTERS BEYOND THIS REPO. The installer gained a guard (installer#541) that
+# refuses a pin bump whose component CI was red at the tagged commit. It reads the
+# commit's check-runs, which is name-agnostic and complete — but at sse-proxy 1.1.9 those
+# check-runs are an image build, four security scans, lint-docs and release-notes. All
+# green, none a test. So the guard reported this component GREEN **vacuously**, and a
+# reader would have taken that as "the code was tested". It did not follow, and a check-run
+# count cannot distinguish it either: 11 here against 13 for a repo that does test.
+#
+# So this workflow is what makes that guard mean anything for sse-proxy. A guard whose
+# green depends on the component actually running tests is only as good as the component.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: go test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Tracks go.mod rather than a literal, so a toolchain bump cannot leave CI
+          # testing against a different version than the build does.
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      # -count=1 defeats the test cache: a cached PASS from an earlier run is not evidence
+      # about this commit, and a cached result is indistinguishable from a fresh one in the
+      # log. core-provider#208 was exactly this — tests reading files outside their module
+      # passed stale.
+      # ONE run serves both purposes: -count=1 defeats the test cache (a cached PASS from an
+      # earlier run is not evidence about THIS commit, and is indistinguishable from a fresh
+      # one in the log — core-provider#208 was exactly that), and -v gives the `=== RUN`
+      # lines the floor below counts. Running the suite twice to count it would be wasteful
+      # and, worse, could disagree with itself.
+      - name: go test (race)
+        run: |
+          set -euo pipefail
+          go test ./... -race -count=1 -v 2>&1 | tee /tmp/go-test.log
+
+      # A suite that compiles and runs ZERO tests passes vacuously. That is not theoretical:
+      # frontend had three suites dark for a day because a module-scope import side-effect
+      # broke COLLECTION rather than assertions — 52 tests silently gone, and the pin that
+      # shipped from that commit reached production.
+      #
+      # FLOOR DERIVED, NOT GUESSED. This tree has 39 top-level `func Test` (auth 2,
+      # events_window 6, main 14, rbac 17) plus 10 `t.Run` subtests, so a healthy run emits
+      # >= 49 `=== RUN` lines. 40 is set to catch the loss of EITHER LARGE FILE:
+      #
+      #   lose rbac_test.go  -> ~32   FAILS
+      #   lose main_test.go  -> ~35   FAILS
+      #   lose events_window -> ~43   passes
+      #   lose auth_test.go  -> ~47   passes
+      #
+      # So it catches a COLLAPSE, not a single test vanishing — stated plainly because a
+      # floor that implies more than it checks is worse than none. Raise it when the suite
+      # grows; a floor that never moves stops meaning anything.
+      - name: assert the suite actually ran tests
+        run: |
+          set -euo pipefail
+          count=$(grep -c '^=== RUN' /tmp/go-test.log || true)
+          echo "test functions run: $count (healthy tree emits >= 49)"
+          if [ "$count" -lt 40 ]; then
+            echo "::error::only $count tests ran, floor is 40 — a suite that collects nothing passes vacuously (sse-proxy#28)"
+            exit 1
+          fi
