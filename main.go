@@ -894,6 +894,9 @@ func main() {
 	// /notifications additionally accepts it via cookie/query param (EventSource
 	// cannot set headers). /health stays unauthenticated for k8s probes.
 	mux.HandleFunc("/events", auth.requireBearer(handleEvents(cfg, outboundClient, scoper)))
+	// /audit takes the JWT in the Authorization header (RESTAction forwards it),
+	// scoped to the caller's namespaces exactly like /events (C8).
+	mux.HandleFunc("/audit", auth.requireBearer(handleAudit(cfg, outboundClient, scoper)))
 	mux.HandleFunc("/notifications/", auth.requireSSEToken(handleSSE(h, scoper)))
 	mux.HandleFunc("/notifications", auth.requireSSEToken(handleSSE(h, scoper)))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
