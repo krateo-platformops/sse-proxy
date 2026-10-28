@@ -559,7 +559,7 @@ const compositionIDFilter = "\n  AND LogAttributes['krateo.io/composition-id'] =
 // Array(String) parameter, never interpolated; every element is additionally
 // validated as an RFC 1123 label before serialization (defence in depth).
 // Cluster-scoped events (empty namespace) are excluded for scoped callers by
-// construction — ” is never in the allowed set.
+// construction: the empty namespace is never in the allowed set.
 const namespaceFilter = "\n  AND JSONExtractString(Body, 'object', 'involvedObject', 'namespace') IN {namespaces:Array(String)}"
 
 // windowPredicatePlaceholder is replaced with either an empty string (the
