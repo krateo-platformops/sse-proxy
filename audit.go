@@ -66,7 +66,8 @@ LIMIT {limit:UInt32}
 FORMAT JSONEachRow`
 
 // auditNamespaceFilter scopes to the caller's namespaces (bound Array(String)).
-// A scoped caller never sees cluster-scoped audit rows: '' is never in the set.
+// A scoped caller never sees cluster-scoped audit rows: the empty namespace is
+// never in the set.
 const auditNamespaceFilter = "\n  AND LogAttributes['k8s.namespace.name'] IN {namespaces:Array(String)}"
 
 // auditWindowFilter bounds the query to rows at or after {since} (unix seconds),
