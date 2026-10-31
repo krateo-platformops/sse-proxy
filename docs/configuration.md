@@ -55,6 +55,9 @@ mandatory)`) rather than serving unauthenticated. For a local dev harness, point
 | `RBAC_SCOPING_ENABLED` | `false` | enforce SubjectAccessReview-derived per-tenant namespace scoping. **Requires the JWKS source to resolve** (auth is always on); since the proxy already refuses to start with `URL_AUTHN` and `JWT_JWKS_URL` both empty, scoping identity is always backed by a verified token |
 | `RBAC_SCOPING_VERB` | `list` | the RBAC verb the scoping check keys on |
 | `RBAC_SCOPING_RESOURCE` | `events` | the RBAC resource |
+| `AUDIT_SCOPING_VERB` | *(inherits `RBAC_SCOPING_VERB`)* | the RBAC verb `/audit` keys on, separately from `/events` |
+| `AUDIT_SCOPING_RESOURCE` | *(inherits `RBAC_SCOPING_RESOURCE`)* | the RBAC resource for `/audit` |
+| `AUDIT_SCOPING_APIGROUP` | *(inherits `RBAC_SCOPING_APIGROUP`)* | the RBAC apiGroup for `/audit` |
 | `RBAC_SCOPING_APIGROUP` | empty (core) | the RBAC apiGroup |
 | `RBAC_SCOPING_CACHE_TTL` | `60s` | per-(user, groups) scope cache TTL (Go duration) |
 | `KUBERNETES_API_URL` | in-cluster | Kubernetes API endpoint override (tests / local runs; in-cluster uses the mounted ServiceAccount token + CA) |
@@ -99,3 +102,33 @@ no values for those env vars today, so enabling them means adding the env to the
 (or using the [`deploy/`](../deploy/deployment.yaml) reference manifest). The chart also
 renders the fixed-name `sse-proxy-internal-endpoint` Secret (`server-url` pointing at
 its own Service) that snowplow RESTActions consume.
+
+### Separating audit access from events access
+
+`/audit` resolves the caller's namespace scope with its own SubjectAccessReview when any
+`AUDIT_SCOPING_*` variable is set, and with the events one otherwise.
+
+**Why it matters.** With none set, the rule that gates the audit trail is
+`RBAC_SCOPING_VERB`/`RBAC_SCOPING_RESOURCE` — `list events` by default. So anyone who can list a
+namespace's events can also read its audit trail, and an audit-read capability cannot be
+distinguished from events access. Setting these separates the two.
+
+**The resource may be virtual.** RBAC permits rules on resources that do not exist as CRDs, and
+SubjectAccessReview evaluates them, so a capability marker works with nothing behind it:
+
+```
+AUDIT_SCOPING_VERB=get
+AUDIT_SCOPING_RESOURCE=auditrecords
+AUDIT_SCOPING_APIGROUP=audit.krateo.io
+```
+
+Grant it in a ClusterRole and bind it **per namespace** with a RoleBinding for tenants — never
+cluster-wide, or the scope resolves to `allowAll` and the caller sees every namespace's rows plus
+the cluster-scoped ones.
+
+**Partial configuration inherits.** Setting only `AUDIT_SCOPING_RESOURCE` changes the resource and
+leaves the verb and apiGroup as the events scoper's, rather than resetting them to built-in
+defaults. Scoping must also be enabled at all (`RBAC_SCOPING_ENABLED=true`); with it off there is no
+scope to narrow and `/audit` is not namespace-filtered.
+
+Behaviour is fail-closed either way: a scope that cannot be resolved yields no rows, never all rows.
