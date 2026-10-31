@@ -75,6 +75,21 @@ const (
 	envRBACScopingResource = "RBAC_SCOPING_RESOURCE"
 	envRBACScopingAPIGroup = "RBAC_SCOPING_APIGROUP"
 	envRBACScopingCacheTTL = "RBAC_SCOPING_CACHE_TTL"
+
+	// /audit resolves scope with its OWN SubjectAccessReview, configured separately from /events.
+	//
+	// WHY. Before this, handleAudit shared the events scoper, so the RBAC rule that gated the audit
+	// trail was `RBAC_SCOPING_VERB/RESOURCE` — `list events` by default. Anyone who could list a
+	// namespace's events could read its audit trail, and an audit-read capability could not be told
+	// apart from events access. The CMP's B2 work needs them distinguishable: audit-read is granted
+	// to auditor, tenant-admin and org-admin, and NOT to everyone who can see events.
+	//
+	// These may name a VIRTUAL resource. RBAC permits rules on resources that do not exist as CRDs
+	// and SubjectAccessReview evaluates them, so e.g. `get auditrecords.audit.krateo.io` works as a
+	// capability marker with no CRD behind it.
+	envAuditScopingVerb     = "AUDIT_SCOPING_VERB"
+	envAuditScopingResource = "AUDIT_SCOPING_RESOURCE"
+	envAuditScopingAPIGroup = "AUDIT_SCOPING_APIGROUP"
 	// envKubeAPIURL overrides the in-cluster API endpoint (tests / local runs).
 	envKubeAPIURL = "KUBERNETES_API_URL"
 
@@ -387,6 +402,56 @@ func loadRBACScoper() (*rbacScoper, error) {
 	}, nil
 }
 
+// loadAuditScoper returns the scoper that /audit must use.
+//
+// IT RETURNS THE EVENTS SCOPER UNCHANGED when no AUDIT_SCOPING_* variable is set. That is what
+// makes this change inert on every existing deployment: same instance, same SAR, same cache, so
+// /audit behaves exactly as before until an operator configures it.
+//
+// A SEPARATE CACHE IS MANDATORY once it diverges, and this is the part that would be a silent
+// authorization bug if shared. cacheKey is username+groups ONLY — it does not include the verb,
+// resource or apiGroup. Two scopers asking DIFFERENT SubjectAccessReviews about the SAME caller
+// would therefore collide on one cache entry, and whichever resolved first would answer for both:
+// an events permission could be served as an audit scope, or the reverse. So a diverging audit
+// scoper gets its own map.
+//
+// kube and ttl are shared deliberately: the API client is stateless for this purpose and a second
+// TTL knob would be configuration nobody asked for.
+//
+// Returns nil when events scoping is disabled — there is nothing to scope, and /audit must not
+// invent an enforcement the rest of the proxy is not applying.
+func loadAuditScoper(events *rbacScoper) *rbacScoper {
+	if events == nil {
+		return nil
+	}
+	verb := getEnv(envAuditScopingVerb, "")
+	resource := getEnv(envAuditScopingResource, "")
+	apiGroup := getEnv(envAuditScopingAPIGroup, "")
+	if verb == "" && resource == "" && apiGroup == "" {
+		return events
+	}
+	// A PARTIAL configuration inherits the events value for whatever is unset, rather than falling
+	// back to a built-in default. Setting only AUDIT_SCOPING_RESOURCE should change the resource and
+	// nothing else; silently resetting the verb to "list" would be a surprise.
+	if verb == "" {
+		verb = events.verb
+	}
+	if resource == "" {
+		resource = events.resource
+	}
+	if apiGroup == "" {
+		apiGroup = events.apiGroup
+	}
+	return &rbacScoper{
+		kube:     events.kube,
+		verb:     verb,
+		apiGroup: apiGroup,
+		resource: resource,
+		ttl:      events.ttl,
+		cache:    make(map[string]scopeEntry),
+	}
+}
+
 func cacheKey(u jwtutil.UserInfo) string {
 	return u.Username + "\x00" + strings.Join(u.Groups, "\x00")
 }
@@ -466,6 +531,31 @@ func (s *rbacScoper) resolve(ctx context.Context, u jwtutil.UserInfo) (*nsScope,
 }
 
 // logStatus prints the scoping posture at startup.
+// logAuditStatus states which RBAC rule gates the audit trail, and whether it differs from events.
+// A reader must be able to tell "audit shares the events permission" from "audit has its own"
+// without inspecting env, because the two have very different security properties.
+func logAuditStatus(audit, events *rbacScoper) {
+	switch {
+	case audit == nil:
+		slogInfo("sse-proxy", "audit scoping DISABLED (rbac scoping is off)")
+	case audit == events:
+		slogInfo("sse-proxy", "audit scoping SHARES the events permission — anyone who can "+
+			envRBACScopingVerb+" "+envRBACScopingResource+" can read the audit trail; set "+
+			envAuditScopingVerb+"/"+envAuditScopingResource+"/"+envAuditScopingAPIGroup+" to separate them",
+			slog.String("verb", audit.verb),
+			slog.String("resource", audit.resource),
+			slog.String("apiGroup", audit.apiGroup),
+		)
+	default:
+		slogInfo("sse-proxy", "audit scoping ENABLED with its OWN permission (SubjectAccessReview-derived, fail-closed)",
+			slog.String("verb", audit.verb),
+			slog.String("resource", audit.resource),
+			slog.String("apiGroup", audit.apiGroup),
+			slog.String("cache_ttl", audit.ttl.String()),
+		)
+	}
+}
+
 func (s *rbacScoper) logStatus() {
 	if s == nil {
 		slogInfo("sse-proxy", "rbac namespace scoping DISABLED — set "+envRBACScopingEnabled+"=true to enforce per-tenant filtering")

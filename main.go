@@ -851,6 +851,11 @@ func main() {
 	}
 	scoper.logStatus()
 
+	// /audit gets its own scoper so an audit-read capability is distinguishable from events access.
+	// Identical to `scoper` unless AUDIT_SCOPING_* is set, so this is inert by default.
+	auditScoper := loadAuditScoper(scoper)
+	logAuditStatus(auditScoper, scoper)
+
 	h := newHub()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -896,7 +901,7 @@ func main() {
 	mux.HandleFunc("/events", auth.requireBearer(handleEvents(cfg, outboundClient, scoper)))
 	// /audit takes the JWT in the Authorization header (RESTAction forwards it),
 	// scoped to the caller's namespaces exactly like /events (C8).
-	mux.HandleFunc("/audit", auth.requireBearer(handleAudit(cfg, outboundClient, scoper)))
+	mux.HandleFunc("/audit", auth.requireBearer(handleAudit(cfg, outboundClient, auditScoper)))
 	mux.HandleFunc("/notifications/", auth.requireSSEToken(handleSSE(h, scoper)))
 	mux.HandleFunc("/notifications", auth.requireSSEToken(handleSSE(h, scoper)))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
