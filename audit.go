@@ -193,9 +193,40 @@ func queryAuditRecords(ctx context.Context, client *http.Client, cfg config, que
 	return rows, nil
 }
 
+// auditScopingDisabledBody is the refusal /audit returns when namespace scoping is off. It names
+// the cause and the fix, because a bare status code sends the reader looking at their own token.
+const auditScopingDisabledBody = `{"error":"audit is unavailable: namespace scoping is disabled",` +
+	`"reason":"RBACScopingDisabled",` +
+	`"detail":"/audit cannot enforce tenant isolation unless RBAC_SCOPING_ENABLED=true. ` +
+	`Refusing rather than returning every namespace's audit records."}`
+
 func handleAudit(cfg config, client *http.Client, scoper *rbacScoper) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
+
+		// FAIL CLOSED WHEN SCOPING IS OFF, IN THE BINARY. A nil scoper means scoping is disabled,
+		// and resolveRequestScope then yields a nil *nsScope -- which nsScope.allows and
+		// buildAuditQuery both treat as allowAll, adding NO namespace predicate. That is the right
+		// behaviour for /events (historic, low sensitivity) and the wrong one for the audit trail:
+		// it would serve every namespace's records, plus the cluster-scoped ones, to any caller
+		// holding a valid bearer token.
+		//
+		// WHY HERE AND NOT AS A DEPLOYMENT DEFAULT. A chart default protects only the install paths
+		// that use our values. `features.*` demonstrated the failure mode on the installer side the
+		// same week: a value silently inert on an upgrade, so the safe setting was simply absent and
+		// nothing said so. A refusal compiled into the binary cannot be dropped by a values file, a
+		// hand-written manifest, or an operator who copied an older deployment.
+		//
+		// 503, NOT 403. The caller's token is not the problem and 403 would send them to check their
+		// own permissions. The server is in a configuration where it cannot answer safely, which is
+		// what 503 says. The route stays registered deliberately: a 404 would be fail-closed too but
+		// leaves whoever hits it with no way to tell "not built" from "not configured".
+		if scoper == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprint(w, auditScopingDisabledBody)
+			return
+		}
 
 		scope, err := resolveRequestScope(r, scoper)
 		if err != nil {

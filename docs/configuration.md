@@ -132,3 +132,16 @@ defaults. Scoping must also be enabled at all (`RBAC_SCOPING_ENABLED=true`); wit
 scope to narrow and `/audit` is not namespace-filtered.
 
 Behaviour is fail-closed either way: a scope that cannot be resolved yields no rows, never all rows.
+
+**`/audit` refuses outright when scoping is off.** With `RBAC_SCOPING_ENABLED` unset or false there is
+no scope to apply, and a nil scope is treated as *allowAll* everywhere else in the proxy — correct for
+`/events`, which is historic and low-sensitivity, and wrong for the audit trail. So `/audit` returns
+**503** with `reason: RBACScopingDisabled` rather than serving every namespace's records to any caller
+holding a valid bearer token.
+
+The refusal is in the binary, not a chart default, deliberately: a default protects only the install
+paths that use these values, while a compiled-in refusal cannot be dropped by a values file, a
+hand-written manifest, or a copied older deployment. It is 503 rather than 403 because the caller's
+token is not the problem — the server is in a configuration where it cannot answer safely. The route
+stays registered rather than returning 404, so whoever hits it can tell "not configured" from
+"not built".
