@@ -172,30 +172,6 @@ func (a authConfig) tokenFromRequestHeaderOrCookie(r *http.Request) (string, boo
 	return "", false
 }
 
-// tokenFromRequestSSE returns the token for the EventSource/SSE path. It tries
-// the header and cookie first (snowplow's convention) and then falls back to a
-// query parameter (`access_token`, then `token`).
-//
-// The query-param fallback exists ONLY because the browser EventSource API
-// cannot set request headers and the portal opens the stream with
-// withCredentials:false (so the session cookie is not sent cross-origin).
-// snowplow's own /refreshes deliberately forbids token-in-URL to avoid leaking
-// it via access logs/Referer; we accept it here as the documented EventSource
-// fallback, so callers MUST keep this token out of logs (this proxy never logs
-// request URLs or query strings).
-func (a authConfig) tokenFromRequestSSE(r *http.Request) (string, bool) {
-	if tok, ok := a.tokenFromRequestHeaderOrCookie(r); ok {
-		return tok, true
-	}
-	q := r.URL.Query()
-	for _, key := range []string{"access_token", "token"} {
-		if v := q.Get(key); v != "" {
-			return v, true
-		}
-	}
-	return "", false
-}
-
 // validate verifies the token exactly as snowplow does: stateless RS256
 // signature verification, resolving authn's public key by the token's "kid"
 // through the JWKS key source (5s leeway, exp enforced; iss/aud not checked).
@@ -218,14 +194,15 @@ func writeAuthError(w http.ResponseWriter, err error) {
 }
 
 // requireBearer wraps a handler with Authorization: Bearer (or cookie)
-// validation — used for the plain HTTP /events endpoint. Verification is
-// mandatory: there is no pass-through.
+// validation, for every endpoint. A token in the query string is refused: a URL
+// reaches access logs and spans. Verification is mandatory: there is no
+// pass-through.
 func (a authConfig) requireBearer(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token, ok := a.tokenFromRequestHeaderOrCookie(r)
 		if !ok {
 			// Do not echo any token material in the error.
-			_ = response.Unauthorized(w, fmt.Errorf("missing or malformed Authorization header"))
+			_ = response.Unauthorized(w, fmt.Errorf("missing credentials: no bearer header or session cookie"))
 			return
 		}
 		ui, err := a.validate(token)
@@ -239,29 +216,10 @@ func (a authConfig) requireBearer(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// requireSSEToken wraps the SSE handler, accepting the token via header,
-// cookie, or query param (EventSource fallback). Verification is mandatory:
-// there is no pass-through.
-func (a authConfig) requireSSEToken(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		token, ok := a.tokenFromRequestSSE(r)
-		if !ok {
-			_ = response.Unauthorized(w, fmt.Errorf("missing credentials: no bearer header, session cookie, or token query param"))
-			return
-		}
-		ui, err := a.validate(token)
-		if err != nil {
-			writeAuthError(w, err)
-			return
-		}
-		next(w, r.WithContext(withUserInfo(r.Context(), ui)))
-	}
-}
-
 // logStatus prints a one-line summary of the auth posture at startup, without
 // ever printing key material.
 func (a authConfig) logStatus() {
-	slogInfo("sse-proxy", "auth ENFORCED (RS256/JWKS, mandatory); SSE token via Authorization header, cookie, or ?access_token=/?token=",
+	slogInfo("sse-proxy", "auth ENFORCED (RS256/JWKS, mandatory); token via Authorization header or cookie",
 		slog.String("jwks_url", a.jwksURL),
 		slog.String("session_cookie", a.sessionCookie),
 	)

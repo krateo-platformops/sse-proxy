@@ -11,6 +11,12 @@ timestamp: 2026-08-07T00:00:00Z
 
 Curated history, newest first.
 
+## 2026-11-05 — query-string tokens refused on every path
+`?access_token=` and `?token=` are gone (#40, installer#395). They existed because
+`EventSource` cannot set headers, and a token in a URL reaches access logs and spans. Removed
+only after the portal moved to `fetch` with a Bearer header (frontend#501) and every cluster
+running this proxy had that frontend. A client still sending one now gets 401.
+
 ## 2026-08-14 — auth hardened to mandatory-by-design (no pass-through, unreleased)
 
 Removed the escape hatch: the proxy now has **no open/pass-through mode**. If no JWKS

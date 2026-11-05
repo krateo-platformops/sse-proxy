@@ -902,8 +902,8 @@ func main() {
 	// /audit takes the JWT in the Authorization header (RESTAction forwards it),
 	// scoped to the caller's namespaces exactly like /events (C8).
 	mux.HandleFunc("/audit", auth.requireBearer(handleAudit(cfg, outboundClient, auditScoper)))
-	mux.HandleFunc("/notifications/", auth.requireSSEToken(handleSSE(h, scoper)))
-	mux.HandleFunc("/notifications", auth.requireSSEToken(handleSSE(h, scoper)))
+	mux.HandleFunc("/notifications/", auth.requireBearer(handleSSE(h, scoper)))
+	mux.HandleFunc("/notifications", auth.requireBearer(handleSSE(h, scoper)))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "ok")

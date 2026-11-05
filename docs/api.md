@@ -47,9 +47,9 @@ Also served at `/notifications/`. Response is `text/event-stream` with
 | `composition_id` | subscribe to that composition's topic only; absent ⇒ the global firehose (the client filters by SSE event name) |
 
 Token acceptance (when auth is enabled), in order: `Authorization: Bearer` header →
-session cookie (`krateo-session`) → `?access_token=` → `?token=`. The query-param
-fallback exists only because `EventSource` cannot set headers; the proxy never logs
-request URLs. Slow consumers drop messages (64-message buffer) rather than stall the
+session cookie (`krateo-session`). A token in the query string is refused with 401,
+because a URL reaches access logs and spans. Clients stream with `fetch` and a Bearer
+header. Slow consumers drop messages (64-message buffer) rather than stall the
 hub; with RBAC scoping on, the scope is fixed at connect time and enforced per message.
 
 ## `GET /health`

@@ -77,10 +77,9 @@ resolved by the token's `kid` from authn's **JWKS** endpoint
 authn signs with its RSA private key and publishes the matching public key set, so the
 proxy holds **no shared secret** and key rotation needs no redeploy. Only RS256 is
 accepted — a token offering HMAC is rejected before the key is consulted, so algorithm
-confusion is impossible. Because the browser `EventSource` API cannot set headers, the
-SSE path also accepts the token via the session cookie (`krateo-session` by default) or
-`?access_token=` / `?token=` (accepted as the documented EventSource fallback; the proxy
-never logs request URLs).
+confusion is impossible. Every path takes the token from the `Authorization` header or
+the session cookie (`krateo-session` by default). A token in the query string is refused,
+because a URL reaches access logs and spans.
 
 Auth is **mandatory by design** — there is no open/pass-through mode. `URL_AUTHN`
 carries a cluster-internal default (`http://authn.krateo-system.svc.cluster.local:8082`),

@@ -129,7 +129,7 @@ func TestRequireBearer_Enabled(t *testing.T) {
 
 func TestRequireSSEToken_Enabled(t *testing.T) {
 	a := testAuthConfig()
-	h := a.requireSSEToken(okHandler)
+	h := a.requireBearer(okHandler)
 
 	cases := []struct {
 		name       string
@@ -138,14 +138,14 @@ func TestRequireSSEToken_Enabled(t *testing.T) {
 		wantStatus int
 	}{
 		{
-			name:       "valid via query access_token",
+			name:       "valid token in access_token query is refused",
 			target:     "/notifications?access_token=" + mint(t, time.Hour),
-			wantStatus: http.StatusOK,
+			wantStatus: http.StatusUnauthorized,
 		},
 		{
-			name:       "valid via query token",
+			name:       "valid token in token query is refused",
 			target:     "/notifications?token=" + mint(t, time.Hour),
-			wantStatus: http.StatusOK,
+			wantStatus: http.StatusUnauthorized,
 		},
 		{
 			name:       "valid via header",
@@ -162,9 +162,10 @@ func TestRequireSSEToken_Enabled(t *testing.T) {
 			wantStatus: http.StatusOK,
 		},
 		{
-			name:       "expired via query",
-			target:     "/notifications?access_token=" + mint(t, -time.Hour),
-			wantStatus: http.StatusUnauthorized,
+			name:       "query token ignored when the header is valid",
+			target:     "/notifications?access_token=not-a-token",
+			setup:      func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+mint(t, time.Hour)) },
+			wantStatus: http.StatusOK,
 		},
 		{
 			name:       "no credentials",
