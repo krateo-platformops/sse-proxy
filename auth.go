@@ -69,7 +69,7 @@ type authConfig struct {
 	keys jwtutil.KeySource
 	// jwksURL is the resolved JWKS document URL, kept for the startup log line.
 	jwksURL string
-	// sessionCookie is the cookie name the SSE/EventSource path reads the token
+	// sessionCookie is the cookie name every authenticated path reads the token
 	// from when no Authorization header is present (matches snowplow's
 	// REFRESH_SESSION_COOKIE, default "krateo-session").
 	sessionCookie string
@@ -193,16 +193,37 @@ func writeAuthError(w http.ResponseWriter, err error) {
 	_ = response.Unauthorized(w, err)
 }
 
-// requireBearer wraps a handler with Authorization: Bearer (or cookie)
-// validation, for every endpoint. A token in the query string is refused: a URL
-// reaches access logs and spans. Verification is mandatory: there is no
+// queryTokenParam returns the first query parameter that could carry a token, or
+// "" if there is none. No endpoint uses these names for anything else.
+func queryTokenParam(r *http.Request) string {
+	q := r.URL.Query()
+	for _, key := range []string{"access_token", "token"} {
+		if q.Has(key) {
+			return key
+		}
+	}
+	return ""
+}
+
+// requireBearer wraps a handler with Authorization: Bearer (or cookie) validation,
+// for every endpoint except /health. Verification is mandatory: there is no
 // pass-through.
+//
+// A request with a token in the query string is refused even when it also carries
+// valid credentials, because a URL reaches access logs and spans and a client that
+// got a 200 would never stop sending it. The warning names the parameter, never its
+// value, so operators can find a stale client.
 func (a authConfig) requireBearer(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if param := queryTokenParam(r); param != "" {
+			slogWarnCtx(r.Context(), "sse-proxy", "refused a token in the query string", slog.String("param", param), slog.String("path", r.URL.Path))
+			_ = response.Unauthorized(w, fmt.Errorf("a token in the query string is not accepted: use the Authorization header"))
+			return
+		}
 		token, ok := a.tokenFromRequestHeaderOrCookie(r)
 		if !ok {
 			// Do not echo any token material in the error.
-			_ = response.Unauthorized(w, fmt.Errorf("missing credentials: no bearer header or session cookie"))
+			_ = response.Unauthorized(w, fmt.Errorf("missing or malformed Authorization header, and no session cookie"))
 			return
 		}
 		ui, err := a.validate(token)

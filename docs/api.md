@@ -46,10 +46,10 @@ Also served at `/notifications/`. Response is `text/event-stream` with
 |---|---|
 | `composition_id` | subscribe to that composition's topic only; absent ⇒ the global firehose (the client filters by SSE event name) |
 
-Token acceptance (when auth is enabled), in order: `Authorization: Bearer` header →
-session cookie (`krateo-session`). A token in the query string is refused with 401,
-because a URL reaches access logs and spans. Clients stream with `fetch` and a Bearer
-header. Slow consumers drop messages (64-message buffer) rather than stall the
+Credentials, in order: `Authorization: Bearer` header, then the session cookie
+(`krateo-session`). A request with `access_token` or `token` in the query string gets 401
+even with valid credentials, because a URL reaches access logs and spans. CORS preflights
+are answered before authentication. Slow consumers drop messages (64-message buffer) rather than stall the
 hub; with RBAC scoping on, the scope is fixed at connect time and enforced per message.
 
 ## `GET /health`

@@ -46,7 +46,7 @@ mandatory)`) rather than serving unauthenticated. For a local dev harness, point
 | `JWT_JWKS_CACHE_TTL` | `5m` | how long a fetched JWKS key set is cached (Go duration) |
 | `JWT_JWKS_MIN_REFRESH_INTERVAL` | `30s` | minimum gap between JWKS refetches on an unknown `kid` (Go duration) |
 | `JWT_JWKS_REQUEST_TIMEOUT` | `5s` | timeout for a single JWKS fetch (Go duration) |
-| `REFRESH_SESSION_COOKIE` | `krateo-session` | cookie name the SSE path reads the token from (snowplow's convention) |
+| `REFRESH_SESSION_COOKIE` | `krateo-session` | cookie name every authenticated path reads the token from (snowplow's convention) |
 
 ## RBAC scoping (`rbac.go`) — opt-in, **unreleased** (on `main`, not in image `1.1.2`; see [release](./release.md))
 

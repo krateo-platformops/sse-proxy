@@ -21,7 +21,10 @@ spec:
                 secretKeyRef:
                   name: sse-proxy-internal-endpoint
                   key: server-url
+            - name: TOKEN
+              # Auth is mandatory. Set a JWT from authn before applying.
+              value: "<paste-a-jwt>"
           command:
             - sh
             - -c
-            - 'curl -sN --max-time 30 "${SERVER_URL}/notifications"; rc=$?; [ "$rc" -eq 28 ] || exit "$rc"'
+            - 'curl -fsSN -H "Authorization: Bearer ${TOKEN}" --max-time 30 "${SERVER_URL}/notifications"; rc=$?; [ "$rc" -eq 28 ] || exit "$rc"'

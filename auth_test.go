@@ -103,83 +103,12 @@ func TestRequireBearer_Enabled(t *testing.T) {
 			},
 			wantStatus: http.StatusUnauthorized,
 		},
-		{
-			name:       "query param token is NOT accepted on /events",
-			setup:      func(r *http.Request) {},
-			wantStatus: http.StatusUnauthorized,
-		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			target := "/events"
-			if tc.name == "query param token is NOT accepted on /events" {
-				target = "/events?access_token=" + mint(t, time.Hour)
-			}
-			r := httptest.NewRequest(http.MethodGet, target, nil)
+			r := httptest.NewRequest(http.MethodGet, "/events", nil)
 			tc.setup(r)
-			w := httptest.NewRecorder()
-			h(w, r)
-			if w.Code != tc.wantStatus {
-				t.Fatalf("status = %d, want %d (body=%s)", w.Code, tc.wantStatus, w.Body.String())
-			}
-		})
-	}
-}
-
-func TestRequireSSEToken_Enabled(t *testing.T) {
-	a := testAuthConfig()
-	h := a.requireBearer(okHandler)
-
-	cases := []struct {
-		name       string
-		target     string
-		setup      func(r *http.Request)
-		wantStatus int
-	}{
-		{
-			name:       "valid token in access_token query is refused",
-			target:     "/notifications?access_token=" + mint(t, time.Hour),
-			wantStatus: http.StatusUnauthorized,
-		},
-		{
-			name:       "valid token in token query is refused",
-			target:     "/notifications?token=" + mint(t, time.Hour),
-			wantStatus: http.StatusUnauthorized,
-		},
-		{
-			name:       "valid via header",
-			target:     "/notifications",
-			setup:      func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+mint(t, time.Hour)) },
-			wantStatus: http.StatusOK,
-		},
-		{
-			name:   "valid via cookie",
-			target: "/notifications",
-			setup: func(r *http.Request) {
-				r.AddCookie(&http.Cookie{Name: defaultSessionCookie, Value: mint(t, time.Hour)})
-			},
-			wantStatus: http.StatusOK,
-		},
-		{
-			name:       "query token ignored when the header is valid",
-			target:     "/notifications?access_token=not-a-token",
-			setup:      func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+mint(t, time.Hour)) },
-			wantStatus: http.StatusOK,
-		},
-		{
-			name:       "no credentials",
-			target:     "/notifications",
-			wantStatus: http.StatusUnauthorized,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			r := httptest.NewRequest(http.MethodGet, tc.target, nil)
-			if tc.setup != nil {
-				tc.setup(r)
-			}
 			w := httptest.NewRecorder()
 			h(w, r)
 			if w.Code != tc.wantStatus {

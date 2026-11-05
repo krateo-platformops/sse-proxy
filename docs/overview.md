@@ -79,7 +79,9 @@ proxy holds **no shared secret** and key rotation needs no redeploy. Only RS256 
 accepted — a token offering HMAC is rejected before the key is consulted, so algorithm
 confusion is impossible. Every path takes the token from the `Authorization` header or
 the session cookie (`krateo-session` by default). A token in the query string is refused,
-because a URL reaches access logs and spans.
+even alongside valid credentials, because a URL reaches access logs and spans. CORS
+preflights are answered before authentication (`cors.go`), so a cross-origin portal works
+with or without a gateway answering them.
 
 Auth is **mandatory by design** — there is no open/pass-through mode. `URL_AUTHN`
 carries a cluster-internal default (`http://authn.krateo-system.svc.cluster.local:8082`),
@@ -123,7 +125,7 @@ structured JSON slog with trace correlation when a span is active (`logging.go`)
 
 ## Platform peers
 
-- **frontend** — the portal events bell opens `EventSource` on `/notifications`.
+- **frontend** — the portal events bell streams `/notifications` with `fetch` and a Bearer header.
 - **snowplow** — the `composition-events` / `events` RESTActions fetch `/events`
   in-cluster through the fixed-name `sse-proxy-internal-endpoint` Secret rendered by
   the deployed chart.

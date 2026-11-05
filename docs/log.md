@@ -11,11 +11,16 @@ timestamp: 2026-08-07T00:00:00Z
 
 Curated history, newest first.
 
-## 2026-11-05 — query-string tokens refused on every path
+## 2026-11-05 — query-string tokens refused, and CORS preflights answered
 `?access_token=` and `?token=` are gone (#40, installer#395). They existed because
-`EventSource` cannot set headers, and a token in a URL reaches access logs and spans. Removed
-only after the portal moved to `fetch` with a Bearer header (frontend#501) and every cluster
-running this proxy had that frontend. A client still sending one now gets 401.
+`EventSource` cannot set headers, and a token in a URL reaches access logs and spans. A request
+carrying either now gets 401 even with valid credentials, and a warning names the parameter.
+Removed only after the portal moved to `fetch` with a Bearer header (frontend#501) and every
+cluster running this proxy had that frontend.
+
+That move also exposed a gap. A cross-origin `fetch` with `Authorization` needs a preflight,
+which this proxy answered with 401, so the bell could not connect on a cluster with no gateway
+answering preflights. a0-openstack-d3 was in that state. `withCORS` now answers them first.
 
 ## 2026-08-14 — auth hardened to mandatory-by-design (no pass-through, unreleased)
 
