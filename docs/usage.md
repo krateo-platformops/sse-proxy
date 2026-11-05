@@ -76,6 +76,8 @@ outside a pod (this is how the tests fake the API — `rbac_test.go`).
 
 ## Consuming it
 
-- Browser: `EventSource('/notifications')`, optionally `?composition_id=<uuid>`.
+- Browser: `fetch('/notifications')` with an `Authorization: Bearer` header, reading the
+  response body as a stream, optionally `?composition_id=<uuid>`. `EventSource` can't set
+  that header.
 - Anything else: `GET /events` — see [api](./api.md) and the
   [examples](./examples.md), which run in-cluster against a stock installer deploy.

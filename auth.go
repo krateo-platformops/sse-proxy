@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -69,7 +70,7 @@ type authConfig struct {
 	keys jwtutil.KeySource
 	// jwksURL is the resolved JWKS document URL, kept for the startup log line.
 	jwksURL string
-	// sessionCookie is the cookie name the SSE/EventSource path reads the token
+	// sessionCookie is the cookie name every authenticated path reads the token
 	// from when no Authorization header is present (matches snowplow's
 	// REFRESH_SESSION_COOKIE, default "krateo-session").
 	sessionCookie string
@@ -172,30 +173,6 @@ func (a authConfig) tokenFromRequestHeaderOrCookie(r *http.Request) (string, boo
 	return "", false
 }
 
-// tokenFromRequestSSE returns the token for the EventSource/SSE path. It tries
-// the header and cookie first (snowplow's convention) and then falls back to a
-// query parameter (`access_token`, then `token`).
-//
-// The query-param fallback exists ONLY because the browser EventSource API
-// cannot set request headers and the portal opens the stream with
-// withCredentials:false (so the session cookie is not sent cross-origin).
-// snowplow's own /refreshes deliberately forbids token-in-URL to avoid leaking
-// it via access logs/Referer; we accept it here as the documented EventSource
-// fallback, so callers MUST keep this token out of logs (this proxy never logs
-// request URLs or query strings).
-func (a authConfig) tokenFromRequestSSE(r *http.Request) (string, bool) {
-	if tok, ok := a.tokenFromRequestHeaderOrCookie(r); ok {
-		return tok, true
-	}
-	q := r.URL.Query()
-	for _, key := range []string{"access_token", "token"} {
-		if v := q.Get(key); v != "" {
-			return v, true
-		}
-	}
-	return "", false
-}
-
 // validate verifies the token exactly as snowplow does: stateless RS256
 // signature verification, resolving authn's public key by the token's "kid"
 // through the JWKS key source (5s leeway, exp enforced; iss/aud not checked).
@@ -217,15 +194,47 @@ func writeAuthError(w http.ResponseWriter, err error) {
 	_ = response.Unauthorized(w, err)
 }
 
-// requireBearer wraps a handler with Authorization: Bearer (or cookie)
-// validation — used for the plain HTTP /events endpoint. Verification is
-// mandatory: there is no pass-through.
+// queryTokenParam returns the name of a query parameter that could carry a token, or
+// "" if there is none. No endpoint uses these names for anything else.
+//
+// It reads the raw query, not r.URL.Query(): that drops a pair it can't parse, such as
+// access_token=JWT;x=1, and matches names by exact case, so a token in the URL would get
+// a 200 and go unnoticed.
+func queryTokenParam(r *http.Request) string {
+	pairs := strings.FieldsFunc(r.URL.RawQuery, func(c rune) bool { return c == '&' || c == ';' })
+	for _, pair := range pairs {
+		name, _, _ := strings.Cut(pair, "=")
+		if decoded, err := url.QueryUnescape(name); err == nil {
+			name = decoded
+		}
+		if name = strings.ToLower(name); name == "access_token" || name == "token" {
+			return name
+		}
+	}
+	return ""
+}
+
+// requireBearer wraps a handler with Authorization: Bearer (or cookie) validation,
+// for every endpoint except /health. Verification is mandatory: there is no
+// pass-through.
+//
+// A request with a token in the query string is refused even when it also carries
+// valid credentials, because a URL reaches access logs and spans and a client that
+// got a 200 would never stop sending it. The warning records the parameter, the route
+// and the User-Agent, never the value, so operators can find a stale client. Route is
+// the registered pattern, so a caller can't choose what it logs, and User-Agent is cut.
 func (a authConfig) requireBearer(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if param := queryTokenParam(r); param != "" {
+			slogWarnCtx(r.Context(), "sse-proxy", "refused a token in the query string",
+				slog.String("param", param), slog.String("route", r.Pattern), slog.String("user_agent", truncate(r.UserAgent(), 120)))
+			_ = response.Unauthorized(w, fmt.Errorf("a token in the query string is not accepted: use the Authorization header"))
+			return
+		}
 		token, ok := a.tokenFromRequestHeaderOrCookie(r)
 		if !ok {
 			// Do not echo any token material in the error.
-			_ = response.Unauthorized(w, fmt.Errorf("missing or malformed Authorization header"))
+			_ = response.Unauthorized(w, fmt.Errorf("missing or malformed Authorization header, and no session cookie"))
 			return
 		}
 		ui, err := a.validate(token)
@@ -239,29 +248,10 @@ func (a authConfig) requireBearer(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// requireSSEToken wraps the SSE handler, accepting the token via header,
-// cookie, or query param (EventSource fallback). Verification is mandatory:
-// there is no pass-through.
-func (a authConfig) requireSSEToken(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		token, ok := a.tokenFromRequestSSE(r)
-		if !ok {
-			_ = response.Unauthorized(w, fmt.Errorf("missing credentials: no bearer header, session cookie, or token query param"))
-			return
-		}
-		ui, err := a.validate(token)
-		if err != nil {
-			writeAuthError(w, err)
-			return
-		}
-		next(w, r.WithContext(withUserInfo(r.Context(), ui)))
-	}
-}
-
 // logStatus prints a one-line summary of the auth posture at startup, without
 // ever printing key material.
 func (a authConfig) logStatus() {
-	slogInfo("sse-proxy", "auth ENFORCED (RS256/JWKS, mandatory); SSE token via Authorization header, cookie, or ?access_token=/?token=",
+	slogInfo("sse-proxy", "auth ENFORCED (RS256/JWKS, mandatory); token via Authorization header or cookie",
 		slog.String("jwks_url", a.jwksURL),
 		slog.String("session_cookie", a.sessionCookie),
 	)

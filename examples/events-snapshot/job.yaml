@@ -21,7 +21,13 @@ spec:
                 secretKeyRef:
                   name: sse-proxy-internal-endpoint
                   key: server-url
+            - name: TOKEN
+              # Auth is mandatory. Create the Secret first; see the README.
+              valueFrom:
+                secretKeyRef:
+                  name: sse-proxy-example-token
+                  key: token
           command:
             - sh
             - -c
-            - 'curl -sf "${SERVER_URL}/events?limit=5"'
+            - 'curl -fsS -H "Authorization: Bearer ${TOKEN}" "${SERVER_URL}/events?limit=5"'

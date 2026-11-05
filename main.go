@@ -712,7 +712,6 @@ func handleEvents(cfg config, client *http.Client, scoper *rbacScoper) http.Hand
 			// Authenticated but authorized for no namespace: empty result,
 			// no ClickHouse round-trip.
 			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Access-Control-Allow-Origin", "*")
 			fmt.Fprint(w, "[]")
 			return
 		}
@@ -737,7 +736,6 @@ func handleEvents(cfg config, client *http.Client, scoper *rbacScoper) http.Hand
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if err := json.NewEncoder(w).Encode(events); err != nil {
 			slogErrorCtx(ctx, "events", "response encode failed", err)
 		}
@@ -771,7 +769,7 @@ func handleSSE(h *hub, scoper *rbacScoper) http.HandlerFunc {
 		// does not scope; see scopeHeaderValue.
 		if v, ok := scope.scopeHeaderValue(); ok {
 			w.Header().Set(scopeHeaderName, v)
-			// Access-Control-Allow-Origin below is "*", i.e. cross-origin use is expected —
+			// withCORS sets Access-Control-Allow-Origin to "*", i.e. cross-origin use is expected —
 			// and a cross-origin `fetch` CANNOT READ a custom response header unless the
 			// server also exposes it. Omitting this would leave the header present on the
 			// wire, invisible to the only consumer that wants it, and the failure would look
@@ -782,7 +780,6 @@ func handleSSE(h *hub, scoper *rbacScoper) http.HandlerFunc {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
 
 		// Optional per-composition subscription. When composition_id is present
@@ -825,6 +822,23 @@ func handleSSE(h *hub, scoper *rbacScoper) http.HandlerFunc {
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+
+// newRouter builds every route. Each endpoint except /health takes the JWT in the
+// Authorization header or the session cookie, and withCORS answers preflights
+// before any of that. /health stays unauthenticated for k8s probes.
+func newRouter(cfg config, auth authConfig, h *hub, client *http.Client, scoper, auditScoper *rbacScoper) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/events", auth.requireBearer(handleEvents(cfg, client, scoper)))
+	// /audit is scoped to the caller's namespaces exactly like /events (C8).
+	mux.HandleFunc("/audit", auth.requireBearer(handleAudit(cfg, client, auditScoper)))
+	mux.HandleFunc("/notifications/", auth.requireBearer(handleSSE(h, scoper)))
+	mux.HandleFunc("/notifications", auth.requireBearer(handleSSE(h, scoper)))
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	})
+	return withCORS(mux)
+}
 
 func main() {
 	// Structured JSON logging as the process default (non-gated; parity with
@@ -894,22 +908,9 @@ func main() {
 	p := newPoller(cfg, h, metrics, outboundClient)
 	go p.run(ctx)
 
-	mux := http.NewServeMux()
-	// /events takes the JWT in the Authorization header (RESTAction forwards it);
-	// /notifications additionally accepts it via cookie/query param (EventSource
-	// cannot set headers). /health stays unauthenticated for k8s probes.
-	mux.HandleFunc("/events", auth.requireBearer(handleEvents(cfg, outboundClient, scoper)))
-	// /audit takes the JWT in the Authorization header (RESTAction forwards it),
-	// scoped to the caller's namespaces exactly like /events (C8).
-	mux.HandleFunc("/audit", auth.requireBearer(handleAudit(cfg, outboundClient, auditScoper)))
-	mux.HandleFunc("/notifications/", auth.requireSSEToken(handleSSE(h, scoper)))
-	mux.HandleFunc("/notifications", auth.requireSSEToken(handleSSE(h, scoper)))
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
-	})
+	router := newRouter(cfg, auth, h, outboundClient, scoper, auditScoper)
 
-	// When tracing is on, wrap the whole mux with otelhttp so inbound requests
+	// When tracing is on, wrap the router with otelhttp so inbound requests
 	// get a server span and the browser's traceparent is extracted into the
 	// request context. /health is filtered out (noise). The SSE handler keeps
 	// its own http.Flusher behaviour intact: otelhttp.NewHandler does not buffer
@@ -918,9 +919,9 @@ func main() {
 	// span for an SSE connection therefore spans the connection lifetime (it
 	// ends when the client disconnects); the short-lived /events fetch gets a
 	// normal request-scoped span.
-	var handler http.Handler = mux
+	handler := router
 	if tel.tracingEnabled {
-		handler = otelhttp.NewHandler(mux, "sse-proxy",
+		handler = otelhttp.NewHandler(router, "sse-proxy",
 			otelhttp.WithFilter(func(r *http.Request) bool {
 				return r.URL.Path != "/health"
 			}),

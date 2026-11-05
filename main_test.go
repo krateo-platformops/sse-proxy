@@ -223,40 +223,30 @@ func TestBearerFromHeader(t *testing.T) {
 	}
 }
 
-func TestTokenFromRequestSSE_Precedence(t *testing.T) {
+func TestTokenFromRequest_NoQueryToken(t *testing.T) {
 	a := testAuthConfig() // sessionCookie defaults to "krateo-session"
 
-	// Header wins over cookie and query.
-	r, _ := http.NewRequest(http.MethodGet, "/notifications?access_token=qtok", nil)
+	// Header wins over cookie.
+	r, _ := http.NewRequest(http.MethodGet, "/notifications", nil)
 	r.Header.Set("Authorization", "Bearer htok")
 	r.AddCookie(&http.Cookie{Name: "krateo-session", Value: "ctok"})
-	if tok, ok := a.tokenFromRequestSSE(r); !ok || tok != "htok" {
+	if tok, ok := a.tokenFromRequestHeaderOrCookie(r); !ok || tok != "htok" {
 		t.Errorf("header should win: got (%q,%v)", tok, ok)
 	}
 
-	// Cookie wins over query when no header.
-	r, _ = http.NewRequest(http.MethodGet, "/notifications?access_token=qtok", nil)
-	r.AddCookie(&http.Cookie{Name: "krateo-session", Value: "ctok"})
-	if tok, ok := a.tokenFromRequestSSE(r); !ok || tok != "ctok" {
-		t.Errorf("cookie should win over query: got (%q,%v)", tok, ok)
-	}
-
-	// Query param fallback (access_token preferred over token).
-	r, _ = http.NewRequest(http.MethodGet, "/notifications?token=t2&access_token=t1", nil)
-	if tok, ok := a.tokenFromRequestSSE(r); !ok || tok != "t1" {
-		t.Errorf("access_token should be preferred: got (%q,%v)", tok, ok)
-	}
-
-	// token used when access_token absent.
-	r, _ = http.NewRequest(http.MethodGet, "/notifications?token=t2", nil)
-	if tok, ok := a.tokenFromRequestSSE(r); !ok || tok != "t2" {
-		t.Errorf("token fallback: got (%q,%v)", tok, ok)
-	}
-
-	// Nothing present.
+	// Cookie is used when there is no header.
 	r, _ = http.NewRequest(http.MethodGet, "/notifications", nil)
-	if tok, ok := a.tokenFromRequestSSE(r); ok || tok != "" {
-		t.Errorf("expected no token, got (%q,%v)", tok, ok)
+	r.AddCookie(&http.Cookie{Name: "krateo-session", Value: "ctok"})
+	if tok, ok := a.tokenFromRequestHeaderOrCookie(r); !ok || tok != "ctok" {
+		t.Errorf("cookie should be used: got (%q,%v)", tok, ok)
+	}
+
+	// A token in the query string is never read.
+	for _, target := range []string{"/notifications?access_token=qtok", "/notifications?token=qtok"} {
+		r, _ = http.NewRequest(http.MethodGet, target, nil)
+		if tok, ok := a.tokenFromRequestHeaderOrCookie(r); ok || tok != "" {
+			t.Errorf("%s: query token must not be read, got (%q,%v)", target, tok, ok)
+		}
 	}
 }
 
