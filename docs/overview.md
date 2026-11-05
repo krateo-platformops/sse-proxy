@@ -80,8 +80,8 @@ accepted — a token offering HMAC is rejected before the key is consulted, so a
 confusion is impossible. Every path takes the token from the `Authorization` header or
 the session cookie (`krateo-session` by default). A token in the query string is refused,
 even alongside valid credentials, because a URL reaches access logs and spans. CORS
-preflights are answered before authentication (`cors.go`), so a cross-origin portal works
-with or without a gateway answering them.
+preflights are answered before authentication (`cors.go`), allowing `Authorization` and
+the trace headers, so a cross-origin portal doesn't need a gateway to answer them.
 
 Auth is **mandatory by design** — there is no open/pass-through mode. `URL_AUTHN`
 carries a cluster-internal default (`http://authn.krateo-system.svc.cluster.local:8082`),

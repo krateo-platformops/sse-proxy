@@ -22,8 +22,11 @@ spec:
                   name: sse-proxy-internal-endpoint
                   key: server-url
             - name: TOKEN
-              # Auth is mandatory. Set a JWT from authn before applying.
-              value: "<paste-a-jwt>"
+              # Auth is mandatory. Create the Secret first; see the README.
+              valueFrom:
+                secretKeyRef:
+                  name: sse-proxy-example-token
+                  key: token
           command:
             - sh
             - -c

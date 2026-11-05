@@ -237,7 +237,6 @@ func handleAudit(cfg config, client *http.Client, scoper *rbacScoper) http.Handl
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if v, ok := scope.scopeHeaderValue(); ok {
 			w.Header().Set(scopeHeaderName, v)
 		}

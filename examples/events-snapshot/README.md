@@ -20,8 +20,13 @@ RESTActions use), so it works whatever the release/Service name is.
   enabled — the `krateo-sse-proxy` chart and its `sse-proxy-internal-endpoint` Secret
   live in `krateo-system`.
 - Auth: JWT validation is mandatory (RS256 against authn's JWKS), and there is no open
-  mode. Put a signed Krateo JWT in the Job's `TOKEN` value, or `/events` answers **401**
-  and the Job fails.
+  mode. Without a valid token `/events` answers **401** and the Job fails. The Job reads
+  a signed Krateo JWT from a Secret:
+
+```sh
+kubectl -n krateo-system create secret generic sse-proxy-example-token \
+  --from-literal=token="$(cat path/to/jwt)"
+```
 
 ## Apply
 

@@ -10,14 +10,19 @@ import "net/http"
 // cross-origin portal gets a 401 on the preflight and the stream never opens. Where
 // a gateway answers preflights itself the request never reaches this code.
 //
-// The origin is "*" as on every handler here: this proxy authenticates with the
-// Authorization header, not with ambient browser credentials.
+// The origin is "*". That is safe only while Access-Control-Allow-Credentials is never
+// sent: this proxy also accepts the session cookie, and a browser refuses to let a
+// credentialed request read a "*" response. Never reflect the Origin or allow credentials
+// here, or cookie-authenticated events become readable cross-site.
+//
+// traceparent and tracestate are allowed because the portal can send them with these
+// requests when browser tracing is on, and main wraps the router to extract them.
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
 			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, traceparent, tracestate")
 			w.Header().Set("Access-Control-Max-Age", "300")
 			w.WriteHeader(http.StatusNoContent)
 			return

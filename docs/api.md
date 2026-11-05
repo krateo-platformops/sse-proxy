@@ -22,7 +22,7 @@ Returns recent Kubernetes events as a JSON array of `SSEK8sEvent`, newest first.
 | `limit` | clamped to `[1, 200]`, default `200` | max rows |
 
 Both params are bound as ClickHouse query parameters, never concatenated into SQL.
-Auth (when enabled): `Authorization: Bearer <jwt>` or the session cookie. With RBAC
+Auth (mandatory): `Authorization: Bearer <jwt>` or the session cookie. With RBAC
 scoping on, results are additionally filtered to the caller's authorized namespaces
 (empty scope ⇒ `[]`, no ClickHouse round-trip).
 

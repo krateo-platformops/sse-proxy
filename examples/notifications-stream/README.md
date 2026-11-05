@@ -19,9 +19,13 @@ any Kubernetes event landing in ClickHouse meanwhile arrives as an
 
 Same as [events-snapshot](../events-snapshot/README.md): a stock installer deploy with
 the observability blueprint (the `sse-proxy-internal-endpoint` Secret in
-`krateo-system`), and a JWT from authn in the Job's `TOKEN` value, because auth is
-mandatory. To see event frames during the window, cause any event — e.g. scale a
-Deployment.
+`krateo-system`), and a JWT from authn in a Secret, because auth is mandatory. To see
+event frames during the window, cause any event — e.g. scale a Deployment.
+
+```sh
+kubectl -n krateo-system create secret generic sse-proxy-example-token \
+  --from-literal=token="$(cat path/to/jwt)"
+```
 
 ## Apply
 

@@ -712,7 +712,6 @@ func handleEvents(cfg config, client *http.Client, scoper *rbacScoper) http.Hand
 			// Authenticated but authorized for no namespace: empty result,
 			// no ClickHouse round-trip.
 			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Access-Control-Allow-Origin", "*")
 			fmt.Fprint(w, "[]")
 			return
 		}
@@ -737,7 +736,6 @@ func handleEvents(cfg config, client *http.Client, scoper *rbacScoper) http.Hand
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if err := json.NewEncoder(w).Encode(events); err != nil {
 			slogErrorCtx(ctx, "events", "response encode failed", err)
 		}
@@ -771,7 +769,7 @@ func handleSSE(h *hub, scoper *rbacScoper) http.HandlerFunc {
 		// does not scope; see scopeHeaderValue.
 		if v, ok := scope.scopeHeaderValue(); ok {
 			w.Header().Set(scopeHeaderName, v)
-			// Access-Control-Allow-Origin below is "*", i.e. cross-origin use is expected —
+			// withCORS sets Access-Control-Allow-Origin to "*", i.e. cross-origin use is expected —
 			// and a cross-origin `fetch` CANNOT READ a custom response header unless the
 			// server also exposes it. Omitting this would leave the header present on the
 			// wire, invisible to the only consumer that wants it, and the failure would look
@@ -782,7 +780,6 @@ func handleSSE(h *hub, scoper *rbacScoper) http.HandlerFunc {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
 
 		// Optional per-composition subscription. When composition_id is present

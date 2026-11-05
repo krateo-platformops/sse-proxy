@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -193,13 +194,21 @@ func writeAuthError(w http.ResponseWriter, err error) {
 	_ = response.Unauthorized(w, err)
 }
 
-// queryTokenParam returns the first query parameter that could carry a token, or
+// queryTokenParam returns the name of a query parameter that could carry a token, or
 // "" if there is none. No endpoint uses these names for anything else.
+//
+// It reads the raw query, not r.URL.Query(): that drops a pair it can't parse, such as
+// access_token=JWT;x=1, and matches names by exact case, so a token in the URL would get
+// a 200 and go unnoticed.
 func queryTokenParam(r *http.Request) string {
-	q := r.URL.Query()
-	for _, key := range []string{"access_token", "token"} {
-		if q.Has(key) {
-			return key
+	pairs := strings.FieldsFunc(r.URL.RawQuery, func(c rune) bool { return c == '&' || c == ';' })
+	for _, pair := range pairs {
+		name, _, _ := strings.Cut(pair, "=")
+		if decoded, err := url.QueryUnescape(name); err == nil {
+			name = decoded
+		}
+		if name = strings.ToLower(name); name == "access_token" || name == "token" {
+			return name
 		}
 	}
 	return ""
@@ -211,12 +220,14 @@ func queryTokenParam(r *http.Request) string {
 //
 // A request with a token in the query string is refused even when it also carries
 // valid credentials, because a URL reaches access logs and spans and a client that
-// got a 200 would never stop sending it. The warning names the parameter, never its
-// value, so operators can find a stale client.
+// got a 200 would never stop sending it. The warning records the parameter, the route
+// and the User-Agent, never the value, so operators can find a stale client. Route is
+// the registered pattern, so a caller can't choose what it logs, and User-Agent is cut.
 func (a authConfig) requireBearer(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if param := queryTokenParam(r); param != "" {
-			slogWarnCtx(r.Context(), "sse-proxy", "refused a token in the query string", slog.String("param", param), slog.String("path", r.URL.Path))
+			slogWarnCtx(r.Context(), "sse-proxy", "refused a token in the query string",
+				slog.String("param", param), slog.String("route", r.Pattern), slog.String("user_agent", truncate(r.UserAgent(), 120)))
 			_ = response.Unauthorized(w, fmt.Errorf("a token in the query string is not accepted: use the Authorization header"))
 			return
 		}
