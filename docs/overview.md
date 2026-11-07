@@ -40,7 +40,7 @@ client is connected, so the first client doesn't receive a backlog. Each row is 
 ## The hub
 
 An in-memory registry of connected clients (`hub` in `main.go`). Delivery is
-**non-blocking**: each client has a 64-message buffer and slow clients drop messages
+**non-blocking**: each client has a buffer of one full poll (500 messages) and slow clients drop messages
 rather than stall the fan-out. A client subscribed with `?composition_id=` receives
 only that topic; otherwise it gets every message (the browser filters by SSE event
 name). A keepalive comment goes out every 25 s to hold intermediaries open.

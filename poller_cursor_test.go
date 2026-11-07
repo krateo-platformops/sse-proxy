@@ -81,3 +81,25 @@ func TestBroadcast_GlobalClientGetsARowOnce(t *testing.T) {
 		t.Fatalf("global client got the row %d times", got)
 	}
 }
+
+// sse-proxy#30: a client that has kept up takes a whole poll without a drop.
+func TestNewClient_HoldsAFullPoll(t *testing.T) {
+	h := newHub()
+	c := newClient("", nil)
+	h.register(c)
+	var dropped int64
+	for i := 0; i < pollLimit; i++ {
+		_, d := h.broadcast(sseMessage{topic: globalTopic, data: []byte("e")})
+		dropped += d
+	}
+	if dropped != 0 {
+		t.Fatalf("a full poll of %d rows dropped %d", pollLimit, dropped)
+	}
+}
+
+func TestPollSQL_UsesPollLimit(t *testing.T) {
+	q := fmt.Sprintf(pollSQL, int64(1), pollLimit)
+	if !strings.Contains(q, fmt.Sprintf("LIMIT %d", pollLimit)) || strings.Contains(q, "%!") {
+		t.Fatalf("poll query doesn't carry pollLimit: %q", q[len(q)-60:])
+	}
+}
