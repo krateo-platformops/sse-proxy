@@ -28,8 +28,9 @@ installed for it to have anything to serve.
 
 Every **3 seconds** (`main.go`, `poller.run`) — and only while at least one SSE client
 is connected — the poller queries `otel_logs` for event rows newer than its
-`lastSeenUnix` watermark (capped at 500 rows, `pollSQL`). The watermark initialises to
-one hour ago so a restart surfaces recent history. Each row is mapped to an
+`lastSeenUnix` watermark (capped at 500 rows, `pollSQL`). The stream is live events only, and
+history comes from `GET /events`: the watermark starts 30 seconds back and stays there while no
+client is connected, so the first client doesn't receive a backlog. Each row is mapped to an
 `SSEK8sEvent` and broadcast twice:
 
 - under the global topic **`krateo`** (the firehose the bell listens to), and

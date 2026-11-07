@@ -157,12 +157,22 @@ type client struct {
 // wants reports whether this client should receive the message: the topic must
 // match the subscription AND the event's namespace must be within the caller's
 // RBAC-derived scope.
+//
+// A client with no topic takes the global topic only. poll() publishes a row with a composition id
+// on both topics, so matching every topic sent that client each of those rows twice.
 func (c *client) wants(msg sseMessage) bool {
-	if c.topic != "" && c.topic != msg.topic {
+	topic := c.topic
+	if topic == "" {
+		topic = globalTopic
+	}
+	if topic != msg.topic {
 		return false
 	}
 	return c.scope.allows(msg.namespace)
 }
+
+// globalTopic carries every event. A composition's events are also published on its own id.
+const globalTopic = "krateo"
 
 type hub struct {
 	mu      sync.RWMutex
@@ -300,14 +310,26 @@ type poller struct {
 	lastSeenUnix int64
 }
 
+// liveLookback is how far behind now the cursor rests while nobody is connected. It covers a row
+// still on its way through the collector, and a client reconnecting after a short outage.
+//
+// The stream is live events only: history comes from GET /events. The cursor used to start an hour
+// back and stay where it was while idle, so the first client after a boot or an idle period got
+// the backlog at 500 rows per poll into a 64-slot buffer. Most of it was dropped, the cursor moved
+// past it anyway, and current events were lost alongside (sse-proxy#30).
+const liveLookback = 30 * time.Second
+
+func liveCursor(now time.Time) int64 {
+	return now.Add(-liveLookback).Unix()
+}
+
 func newPoller(cfg config, h *hub, m *proxyMetrics, client *http.Client) *poller {
-	// Initialise to one hour ago to surface recent events on startup.
 	return &poller{
 		cfg:          cfg,
 		hub:          h,
 		metrics:      m,
 		client:       client,
-		lastSeenUnix: time.Now().Add(-1 * time.Hour).Unix(),
+		lastSeenUnix: liveCursor(time.Now()),
 	}
 }
 
@@ -318,14 +340,22 @@ func (p *poller) run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			if p.hub.count() == 0 {
-				// No clients connected – skip the poll to avoid unnecessary load.
-				continue
-			}
-			p.poll(ctx)
+		case now := <-ticker.C:
+			p.tick(ctx, now)
 		}
 	}
+}
+
+// tick polls for connected clients. With none it skips the query, and keeps the cursor live so the
+// next client starts from now and not from when the last one left.
+func (p *poller) tick(ctx context.Context, now time.Time) {
+	if p.hub.count() == 0 {
+		if c := liveCursor(now); c > p.lastSeenUnix {
+			p.lastSeenUnix = c
+		}
+		return
+	}
+	p.poll(ctx)
 }
 
 func (p *poller) poll(ctx context.Context) {
@@ -357,7 +387,7 @@ func (p *poller) poll(ctx context.Context) {
 		// Global topic — mirrors eventsse behaviour where all events
 		// are published under the "krateo" topic. The event's namespace rides
 		// along so the hub can enforce per-client RBAC scoping at fan-out.
-		s, d := p.hub.broadcast(sseMessage{topic: "krateo", data: data, namespace: row.ObjNamespace})
+		s, d := p.hub.broadcast(sseMessage{topic: globalTopic, data: data, namespace: row.ObjNamespace})
 		delivered += s
 		dropped += d
 

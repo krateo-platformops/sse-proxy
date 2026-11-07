@@ -130,7 +130,7 @@ func TestClientWants(t *testing.T) {
 		want       bool
 	}{
 		{"global gets krateo", "", "krateo", true},
-		{"global gets composition", "", "comp-123", true},
+		{"global skips the composition copy of a row it already got", "", "comp-123", false},
 		{"composition gets own", "comp-123", "comp-123", true},
 		{"composition ignores other", "comp-123", "comp-999", false},
 		{"composition ignores global krateo", "comp-123", "krateo", false},
@@ -158,9 +158,9 @@ func TestHubBroadcastRespectsTopic(t *testing.T) {
 	h.broadcast(sseMessage{topic: "krateo", data: []byte("g")})
 	h.broadcast(sseMessage{topic: "A", data: []byte("a")})
 
-	// global: both messages.
-	if got := len(global.ch); got != 2 {
-		t.Errorf("global client received %d msgs, want 2", got)
+	// global: the global topic only. poll() publishes every row there.
+	if got := len(global.ch); got != 1 {
+		t.Errorf("global client received %d msgs, want 1", got)
 	}
 	// compA: only the "A" message.
 	if got := len(compA.ch); got != 1 {
