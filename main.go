@@ -154,6 +154,11 @@ type client struct {
 	scope *nsScope
 }
 
+// newClient is a subscriber with room for one full poll.
+func newClient(topic string, scope *nsScope) *client {
+	return &client{ch: make(chan sseMessage, clientBuffer), topic: topic, scope: scope}
+}
+
 // wants reports whether this client should receive the message: the topic must
 // match the subscription AND the event's namespace must be within the caller's
 // RBAC-derived scope.
@@ -203,7 +208,7 @@ func (h *hub) unregister(c *client) {
 // test than one that returns numbers.
 //
 // WHY THE DROPPED COUNT MATTERS. The send is deliberately non-blocking — a slow client
-// must not stall the fan-out — so an overflowing 64-slot channel silently discards. The
+// must not stall the fan-out — so an overflowing channel silently discards. The
 // poll cursor then advances past those rows regardless (see poll), so they are lost
 // permanently rather than delayed. That combination was entered 56 times in one morning
 // on krateo-057, in bursts of 500 rows per 3s poll after an idle period, and NOTHING
@@ -299,7 +304,7 @@ WHERE ResourceAttributes['telemetry.source'] = 'k8s-events'
   AND JSONExtractString(Body, 'object', 'reason') != ''
   AND Timestamp >= toDateTime64(%d, 9)
 ORDER BY Timestamp ASC
-LIMIT 500
+LIMIT %d
 FORMAT JSONEachRow`
 
 type poller struct {
@@ -309,6 +314,16 @@ type poller struct {
 	client       *http.Client
 	lastSeenUnix int64
 }
+
+// pollLimit caps one poll. Each client's buffer holds a full poll, so a poll can only drop for a
+// client that is still behind on the previous one. With 64 slots, ordinary bursts of 68 to 257 rows
+// dropped about 1 event in 9 on krateo-057 (sse-proxy#30). A full buffer is about 500 encoded
+// events per connected client.
+const pollLimit = 500
+
+// clientBuffer holds one poll for any client. A global client takes each row once; a composition
+// client takes at most the rows of its composition.
+const clientBuffer = pollLimit
 
 // liveLookback is how far behind now the cursor rests while nobody is connected. It covers a row
 // still on its way through the collector, and a client reconnecting after a short outage.
@@ -359,7 +374,7 @@ func (p *poller) tick(ctx context.Context, now time.Time) {
 }
 
 func (p *poller) poll(ctx context.Context) {
-	query := fmt.Sprintf(pollSQL, p.lastSeenUnix+1)
+	query := fmt.Sprintf(pollSQL, p.lastSeenUnix+1, pollLimit)
 	rows, err := queryClickHouse(ctx, p.client, p.cfg, query, nil)
 	if err != nil {
 		p.metrics.incPollError(ctx)
@@ -819,7 +834,7 @@ func handleSSE(h *hub, scoper *rbacScoper) http.HandlerFunc {
 		// name, the original behaviour.
 		topic := r.URL.Query().Get("composition_id")
 
-		c := &client{ch: make(chan sseMessage, 64), topic: topic, scope: scope}
+		c := newClient(topic, scope)
 		h.register(c)
 		defer h.unregister(c)
 
