@@ -1,7 +1,8 @@
-# sse-proxy — LLM doc index (pinned: image 1.1.2; main is ahead — RBAC scoping #6 and the
-# module-identity migration are unreleased because the v1.2.0 tag shipped no artifact).
+# sse-proxy — LLM doc index (pinned: image 1.5.0, the release that bounds /events, adds the
+# per-event composition object, answers 499 to a caller that left and logs auth 503s).
 # One line per file; regenerate the pin on release (bare-semver tags only, no v prefix).
-# The deployed Helm chart is NOT in this repo: clickstack-chart charts/krateo-sse-proxy.
+# The deployed Helm chart is NOT in this repo: krateo-platformops/observability
+# charts/krateo-sse-proxy (the repo formerly named clickstack-chart).
 docs/index.md: the map — what sse-proxy is + links to the whole bundle; the release-state note
 docs/overview.md: how it works — ClickHouse poller, in-memory hub/topics, RS256/JWKS auth (mandatory, enforced by design) + RBAC scoping, gated OTel
 docs/usage.md: how it reaches a cluster — installer via clickstack-chart, standalone helm, deploy/ manifest, local run

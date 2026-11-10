@@ -580,8 +580,8 @@ func TestHandleEvents_CompleteAnswerHeaders(t *testing.T) {
 	if got := rec.Header().Get(eventsStatusHeader); got != eventsStatusComplete {
 		t.Fatalf("%s = %q, want complete", eventsStatusHeader, got)
 	}
-	if got := rec.Header().Get(eventsWindowHeader); got != "86400" {
-		t.Fatalf("%s = %q, want the 24h default (86400)", eventsWindowHeader, got)
+	if got := rec.Header().Get(eventsWindowHeader); got != "604800" {
+		t.Fatalf("%s = %q, want the 168h default (604800)", eventsWindowHeader, got)
 	}
 	expose := rec.Header().Get("Access-Control-Expose-Headers")
 	if !strings.Contains(expose, eventsStatusHeader) || !strings.Contains(expose, eventsWindowHeader) {
@@ -590,6 +590,39 @@ func TestHandleEvents_CompleteAnswerHeaders(t *testing.T) {
 	var evs []SSEK8sEvent
 	if err := json.Unmarshal(rec.Body.Bytes(), &evs); err != nil || len(evs) != 1 {
 		t.Fatalf("body must stay an SSEK8sEvent array: %v %s", err, rec.Body)
+	}
+}
+
+// TestHandleEvents_NoWindowReadsTheWholeRetention pins Diego's 2026-11-10
+// decision: a request without ?window= returns what it returned before reads
+// were bounded, so no consumer has to change. A sparse history (one row 3 days
+// old, one 6 days old) must come back whole, and the widest query must reach
+// back the full 168h. Mutation: set defaultEventsWindow back to 24h and both
+// rows vanish from the answer and the widest since moves to now-24h.
+func TestHandleEvents_NoWindowReadsTheWholeRetention(t *testing.T) {
+	now := time.Now().Unix()
+	f := &fakeEventsCH{rows: []int64{now - 3*24*3600, now - 6*24*3600}}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+
+	before := time.Now().Unix()
+	rec := serveEvents(t, config{clickhouseURL: srv.URL}, srv.Client(), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var evs []SSEK8sEvent
+	if err := json.Unmarshal(rec.Body.Bytes(), &evs); err != nil || len(evs) != 2 {
+		t.Fatalf("want both rows of a sparse 7-day history, got %d (%v): %s", len(evs), err, rec.Body)
+	}
+	sinces := f.recordedSinces()
+	if len(sinces) != 3 {
+		t.Fatalf("a sparse history must walk 1h, 24h, 168h: sinces=%v", sinces)
+	}
+	if d := before - 7*24*3600 - sinces[2]; d < -1 || d > 1 {
+		t.Fatalf("widest default query since=%d, want ~now-168h (%d)", sinces[2], before-7*24*3600)
+	}
+	if defaultEventsWindow != defaultEventsMaxWindow {
+		t.Fatalf("default window %v must equal the max %v (otel_logs' TTL)", defaultEventsWindow, defaultEventsMaxWindow)
 	}
 }
 

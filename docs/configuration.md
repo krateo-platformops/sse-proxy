@@ -4,7 +4,7 @@ title: sse-proxy — configuration
 description: Every env var sse-proxy reads, with defaults and release-state caveats, and how the deployed chart in clickstack-chart wires them.
 resource: ghcr.io/krateo-platformops/sse-proxy
 tags: [configuration, env]
-timestamp: 2026-08-07T00:00:00Z
+timestamp: 2026-11-10T00:00:00Z
 ---
 
 # Configuration
@@ -21,11 +21,13 @@ Grouped by the file that reads them.
 | `CLICKHOUSE_PASSWORD` | empty | ClickHouse basic-auth password (chart: from the `clickhouse-credentials` Secret, optional) |
 | `LISTEN_ADDR` | `:8080` | listen address |
 | `EVENTS_QUERY_TIMEOUT` | `4s` | deadline for one `/events` request's ClickHouse work, all windows together (Go duration). Keep it below the caller's upstream timeout (snowplow: 10 s), or the caller gives up first and the client gets a `5xx` instead of a partial answer |
-| `EVENTS_DEFAULT_WINDOW` | `24h` | window of an `/events` request without `?window=` (Go duration; never above `EVENTS_MAX_WINDOW`) |
+| `EVENTS_DEFAULT_WINDOW` | `168h` | window of an `/events` request without `?window=` (Go duration; never above `EVENTS_MAX_WINDOW`). The default equals the max, so a request without `window` returns what it did before reads were bounded |
 | `EVENTS_MAX_WINDOW` | `168h` | widest window an `/events` request may ask for (Go duration). `168h` matches `otel_logs`' 7-day TTL |
+| `AUDIT_QUERY_TIMEOUT` | `8s` | deadline for one `/audit` request's ClickHouse query (Go duration). On the deadline `/audit` answers `500`, as for any ClickHouse failure; there is no partial answer. Keep it below the caller's upstream timeout |
 
-Every ClickHouse query sets `readonly=2`, `cancel_http_readonly_queries_on_client_close=1`
-and, when it has a deadline, `max_execution_time`. The ClickHouse user must therefore be
+Every ClickHouse query (`/events`, `/audit` and the poller) sets `readonly=2`,
+`cancel_http_readonly_queries_on_client_close=1` and, when it has a deadline (`/events`,
+`/audit`), `max_execution_time`. The ClickHouse user must therefore be
 allowed to change settings (`readonly` 0 or 2); a `readonly=1` user refuses these queries.
 
 ## Logging (`logging.go`)

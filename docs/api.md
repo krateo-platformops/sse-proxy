@@ -4,7 +4,7 @@ title: sse-proxy — API
 description: The HTTP/SSE contract — /events, /notifications, /health, the SSEK8sEvent payload, token acceptance and injection-safety guarantees.
 resource: ghcr.io/krateo-platformops/sse-proxy
 tags: [api, http, sse]
-timestamp: 2026-08-07T00:00:00Z
+timestamp: 2026-11-10T00:00:00Z
 ---
 
 # API
@@ -20,7 +20,7 @@ Returns recent Kubernetes events as a JSON array of `SSEK8sEvent`, newest first.
 |---|---|---|
 | `composition_id` | must be an RFC 4122 UUID, else `400` | server-side filter on the event's `krateo.io/composition-id` attribute, which covers the composition's own events and those of the resources it manages (see [overview](./overview.md)) |
 | `limit` | clamped to `[1, 200]`, default `200` | max rows |
-| `window` | a Go duration (`6h`, `90m`); default `EVENTS_DEFAULT_WINDOW` (`24h`), clamped to `EVENTS_MAX_WINDOW` (`168h`); unparseable or non-positive ⇒ `400` | how far back to look. Every query is time-bounded; there is no unbounded form |
+| `window` | a Go duration (`6h`, `90m`); default `EVENTS_DEFAULT_WINDOW` (`168h`), clamped to `EVENTS_MAX_WINDOW` (`168h`, `otel_logs`' TTL); unparseable or non-positive ⇒ `400` | how far back to look. Without it the read covers everything the table retains, as before reads were bounded, so existing callers need no change; pass a narrower window for less history or a cheaper read. Every query is time-bounded; there is no unbounded form |
 
 All params are bound as ClickHouse query parameters, never concatenated into SQL.
 Auth (mandatory): `Authorization: Bearer <jwt>` or the session cookie. With RBAC
@@ -40,6 +40,8 @@ say how complete it is; both are listed in `Access-Control-Expose-Headers`.
 The deadline is `EVENTS_QUERY_TIMEOUT` (default `4s`) for all of one request's ClickHouse
 work. It sits below snowplow's 10 s upstream timeout, so a slow ClickHouse produces a `200`
 with `X-Events-Status: timeout` or `partial` instead of a cut-off request and a `5xx`.
+A caller that goes away before the answer gets `499` (client closed request), logged at INFO
+as `caller canceled`: it is not a server error, so the server span stays `Unset`.
 ClickHouse stops at the same time: every query carries `max_execution_time` (the time left)
 and `cancel_http_readonly_queries_on_client_close=1` with `readonly=2`. A deadline is logged
 at most once a minute, with the number of suppressed occurrences. Any other ClickHouse
@@ -97,9 +99,17 @@ Always unauthenticated; `200 ok`. Used by the liveness/readiness probes.
   "type": "Normal | Warning",
   "firstTimestamp": "...", "lastTimestamp": "...", "eventTime": "...",
   "source": { "component": "..." },
-  "compositionId": "krateo.io/composition-id or empty"
+  "compositionId": "krateo.io/composition-id or empty",
+  "composition": { "id": "...", "namespace": "...", "name": "..." }
 }
 ```
+
+`composition` is present only when the event carries a composition id, so a cluster-wide
+event has no `composition` key at all. `namespace` and `name` are omitted when empty: they
+come from `krateo.io/composition-namespace` and `krateo.io/composition-name`, which
+otel-collector writes from 1.0.8 on, so older rows give `{"id": "..."}` only. `compositionId`
+stays, with the same id, for existing clients. `/events` and the `/notifications` stream
+carry the same shape.
 
 `metadata` mirrors the involved object (name/namespace/uid) and `firstTimestamp` /
 `lastTimestamp` / `creationTimestamp` all carry the resolved event time — the proxy
@@ -110,7 +120,11 @@ reconstructs the shape from the flattened ClickHouse row.
 | Condition | Response |
 |---|---|
 | missing/invalid/expired JWT (auth on) | `401` (plumbing error shape; no token material echoed) |
-| malformed `composition_id` | `400` |
+| authn's signing key unavailable (JWKS unreachable, or no key for the token's `kid`) | `503`, and a WARN `token signing key unavailable; answered 503` with `reason` (`jwks_unavailable` or `unknown_kid`) and the `kid`, at most once a minute per reason with a suppressed count. The token is never logged |
+| malformed `composition_id` or `window` | `400` |
+| `/events` deadline (`EVENTS_QUERY_TIMEOUT`) | `200` with `X-Events-Status: partial` or `timeout` (above) |
+| `/audit` deadline (`AUDIT_QUERY_TIMEOUT`) | `500`, like any `/audit` ClickHouse failure |
+| the caller went away (`/events`, `/audit`) | `499`, INFO `caller canceled`; no ERROR line, server span `Unset` |
 | ClickHouse or RBAC-scope resolution error | `500` (fail closed — a scoping error never widens access) |
 
 ## Metrics (when `OTEL_METRICS_ENABLED`)

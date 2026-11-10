@@ -11,8 +11,9 @@
 //	GET /events         JSON snapshot of recent events (SSEK8sEvent[]). Optional
 //	                    query params: composition_id (UUID; server-side filter),
 //	                    limit (1..200, default 200) and window (Go duration,
-//	                    default 24h, max 168h). X-Events-Status says whether the
-//	                    answer is complete, partial or timed out.
+//	                    default and max 168h, otel_logs' TTL). X-Events-Status
+//	                    says whether the answer is complete, partial or timed
+//	                    out.
 //	GET /notifications  the SSE stream. Optional composition_id query param
 //	                    subscribes to a single composition's events; absent ⇒
 //	                    the global firehose (client filters by SSE event name).
@@ -82,7 +83,27 @@ type SSEK8sEvent struct {
 	// for cluster-wide events that carry no composition). Exposed so clients can
 	// see/scope events by composition. Camel-cased to match the rest of this
 	// payload (which mirrors the frontend SSEK8sEvent/EventV1 TS type).
+	//
+	// Kept as it is for compatibility: Composition below carries the same id
+	// plus the composition's name and namespace.
 	CompositionID string `json:"compositionId"`
+	// Composition names the composition the event belongs to. It is present
+	// only when the event carries a composition id; see EventComposition.
+	Composition *EventComposition `json:"composition,omitempty"`
+}
+
+// EventComposition identifies an event's composition by id and, when the
+// collector stamped them, by namespace and name.
+//
+// otel-collector 1.0.8 writes krateo.io/composition-name and
+// krateo.io/composition-namespace into LogAttributes next to
+// krateo.io/composition-id. Rows written before that carry the id only, so
+// namespace and name are omitted when empty rather than sent as "": a client
+// can tell "not known" from a composition really named "".
+type EventComposition struct {
+	ID        string `json:"id"`
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -93,18 +114,20 @@ type SSEK8sEvent struct {
 // ---------------------------------------------------------------------------
 
 type chRow struct {
-	TsUnix          int64  `json:"ts_unix"`
-	CompositionID   string `json:"composition_id"`
-	ObjAPIVersion   string `json:"obj_apiversion"`
-	ObjName         string `json:"obj_name"`
-	ObjNamespace    string `json:"obj_namespace"`
-	ObjUID          string `json:"obj_uid"`
-	ObjKind         string `json:"obj_kind"`
-	Reason          string `json:"reason"`
-	Message         string `json:"message"`
-	Type            string `json:"type"`
-	EventTime       string `json:"event_time"`
-	SourceComponent string `json:"source_component"`
+	TsUnix               int64  `json:"ts_unix"`
+	CompositionID        string `json:"composition_id"`
+	CompositionName      string `json:"composition_name"`
+	CompositionNamespace string `json:"composition_namespace"`
+	ObjAPIVersion        string `json:"obj_apiversion"`
+	ObjName              string `json:"obj_name"`
+	ObjNamespace         string `json:"obj_namespace"`
+	ObjUID               string `json:"obj_uid"`
+	ObjKind              string `json:"obj_kind"`
+	Reason               string `json:"reason"`
+	Message              string `json:"message"`
+	Type                 string `json:"type"`
+	EventTime            string `json:"event_time"`
+	SourceComponent      string `json:"source_component"`
 }
 
 func (row chRow) toSSEK8sEvent() SSEK8sEvent {
@@ -126,6 +149,13 @@ func (row chRow) toSSEK8sEvent() SSEK8sEvent {
 	evt.EventTime = row.EventTime
 	evt.Source.Component = row.SourceComponent
 	evt.CompositionID = row.CompositionID
+	if row.CompositionID != "" {
+		evt.Composition = &EventComposition{
+			ID:        row.CompositionID,
+			Namespace: row.CompositionNamespace,
+			Name:      row.CompositionName,
+		}
+	}
 	return evt
 }
 
@@ -256,6 +286,9 @@ type config struct {
 	eventsTimeout   time.Duration
 	eventsWindowDef time.Duration
 	eventsWindowMax time.Duration
+
+	// /audit query deadline. Zero means defaultAuditQueryTimeout.
+	auditTimeout time.Duration
 }
 
 func loadConfig() config {
@@ -267,7 +300,17 @@ func loadConfig() config {
 		eventsTimeout:      getEnvDuration("EVENTS_QUERY_TIMEOUT", defaultEventsQueryTimeout),
 		eventsWindowDef:    getEnvDuration("EVENTS_DEFAULT_WINDOW", defaultEventsWindow),
 		eventsWindowMax:    getEnvDuration("EVENTS_MAX_WINDOW", defaultEventsMaxWindow),
+		auditTimeout:       getEnvDuration("AUDIT_QUERY_TIMEOUT", defaultAuditQueryTimeout),
 	}
+}
+
+// auditQueryTimeout bounds one /audit request's ClickHouse query. Like
+// eventsQueryTimeout it stays below the caller's upstream timeout.
+func (c config) auditQueryTimeout() time.Duration {
+	if c.auditTimeout > 0 {
+		return c.auditTimeout
+	}
+	return defaultAuditQueryTimeout
 }
 
 // eventsQueryTimeout bounds one /events request's ClickHouse work, all windows
@@ -324,11 +367,15 @@ func getEnv(key, fallback string) string {
 // toUnixTimestamp(ts) > N  <=>  ts >= N+1) and prunes to the newest granule
 // (EXPLAIN indexes=1: 1 part / 1 granule). poll() passes lastSeenUnix+1.
 // Events are stored as raw JSON in Body by the k8sobjects receiver.
-// The compositionresolver processor enriches LogAttributes with krateo.io/composition-id.
+// The compositionresolver processor enriches LogAttributes with krateo.io/composition-id
+// and, from otel-collector 1.0.8, krateo.io/composition-name and
+// krateo.io/composition-namespace (empty on older rows; see EventComposition).
 // %%Y, %%m etc. become %Y, %m after fmt.Sprintf substitutes %d for the timestamp.
 const pollSQL = `SELECT
     toUnixTimestamp(Timestamp)                                                      AS ts_unix,
     ifNull(LogAttributes['krateo.io/composition-id'], '')                           AS composition_id,
+    ifNull(LogAttributes['krateo.io/composition-name'], '')                         AS composition_name,
+    ifNull(LogAttributes['krateo.io/composition-namespace'], '')                    AS composition_namespace,
     ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'apiVersion'), '')   AS obj_apiversion,
     ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'name'), '')         AS obj_name,
     ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'namespace'), '')    AS obj_namespace,
@@ -522,6 +569,44 @@ func isQueryTimeout(ctx context.Context, err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) && errors.Is(ctx.Err(), context.DeadlineExceeded)
 }
 
+// statusClientClosedRequest is nginx's 499 "client closed request": the caller
+// went away before the answer was ready. Nobody reads the response, so the code
+// is for the server span and the access log.
+//
+// WHY NOT 500. A caller that gives up (a browser tab closed, a portal
+// navigation, snowplow cutting the request at its own timeout) is not a server
+// fault. As a 500 it was logged at ERROR as "clickhouse query failed" and the
+// otelhttp server span got status Error. A 4xx server span is Unset by semconv,
+// so with 499 the server span records the code without claiming a failure.
+//
+// What 499 does NOT change: the aborted ClickHouse request's CLIENT span
+// (otelhttp transport, when tracing is on) still ends with status Error
+// "context canceled", because otelhttp marks every transport error that way;
+// and the tail sampler's http-status-400-or-more rule keeps any span with a
+// status code >= 400, 499 included. So such traces are still sampled; only the
+// server span stops reporting them as server errors.
+const statusClientClosedRequest = 499
+
+// callerGone reports whether the request's own context was canceled, which
+// for an inbound request means the client went away. A deadline sse-proxy set
+// itself is a context DERIVED from the request's, so it never makes the
+// request's context report Canceled.
+func callerGone(r *http.Request) bool {
+	return errors.Is(r.Context().Err(), context.Canceled)
+}
+
+// answerCallerGone records that the caller went away: a 499 and an INFO line,
+// never the ERROR a server-side failure gets. err is what the in-flight work
+// returned when the cancellation reached it.
+func answerCallerGone(w http.ResponseWriter, r *http.Request, component string, err error) {
+	attrs := []any{slog.String("route", r.Pattern)}
+	if err != nil {
+		attrs = append(attrs, slog.String("error", err.Error()))
+	}
+	slogInfoCtx(r.Context(), component, "caller canceled", attrs...)
+	w.WriteHeader(statusClientClosedRequest)
+}
+
 // queryClickHouse runs query against ClickHouse over HTTP. Any params are
 // passed as ClickHouse query parameters (param_<name>=<value> on the request
 // URL) so the SQL can reference them safely as {name:Type} placeholders —
@@ -547,6 +632,30 @@ func isQueryTimeout(ctx context.Context, err error) bool {
 // This requires the ClickHouse user to allow changing settings (readonly 0 or
 // 2); a readonly=1 user refuses any query that sets one.
 func queryClickHouse(ctx context.Context, client *http.Client, cfg config, query string, params map[string]string) ([]chRow, error) {
+	body, err := postClickHouse(ctx, client, cfg, query, params)
+	if err != nil {
+		return nil, err
+	}
+	var rows []chRow
+	for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
+		if line == "" {
+			continue
+		}
+		var row chRow
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			slogErrorCtx(ctx, "query", "row unmarshal failed", err, slog.String("line", line))
+			continue
+		}
+		rows = append(rows, row)
+	}
+	return rows, nil
+}
+
+// postClickHouse is the one ClickHouse round trip every read goes through
+// (/events, the poller and /audit): it binds params, sets the server-side
+// settings described on queryClickHouse, and returns the raw body of a 200 or a
+// *clickhouseError for any other status.
+func postClickHouse(ctx context.Context, client *http.Client, cfg config, query string, params map[string]string) ([]byte, error) {
 	if client == nil {
 		client = http.DefaultClient
 	}
@@ -594,20 +703,7 @@ func queryClickHouse(ctx context.Context, client *http.Client, cfg config, query
 	if resp.StatusCode != http.StatusOK {
 		return nil, newClickhouseError(resp.StatusCode, body)
 	}
-
-	var rows []chRow
-	for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
-		if line == "" {
-			continue
-		}
-		var row chRow
-		if err := json.Unmarshal([]byte(line), &row); err != nil {
-			slogErrorCtx(ctx, "query", "row unmarshal failed", err, slog.String("line", line))
-			continue
-		}
-		rows = append(rows, row)
-	}
-	return rows, nil
+	return body, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -659,6 +755,8 @@ const namespacePredicatePlaceholder = "/*NAMESPACE_PREDICATE*/"
 const eventsSQLTemplate = `SELECT
     toUnixTimestamp(Timestamp)                                                      AS ts_unix,
     ifNull(LogAttributes['krateo.io/composition-id'], '')                           AS composition_id,
+    ifNull(LogAttributes['krateo.io/composition-name'], '')                         AS composition_name,
+    ifNull(LogAttributes['krateo.io/composition-namespace'], '')                    AS composition_namespace,
     ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'apiVersion'), '')   AS obj_apiversion,
     ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'name'), '')         AS obj_name,
     ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'namespace'), '')    AS obj_namespace,
@@ -757,13 +855,28 @@ const namespaceFilter = "\n  AND ResourceAttributes['k8s.namespace.name'] IN {na
 
 // Window defaults. A request may narrow the window with ?window=; it can never
 // widen it past the maximum. The maximum matches otel_logs' 7-day TTL, so the
-// cap never hides a row the table still holds; the 24h default bounds the cost
-// of a read that cannot prune (an unscoped read of a sparse composition), which
-// on krateo-057 scanned ~1.2M rows over 7 days against ~250k over 24h.
+// cap never hides a row the table still holds.
+//
+// THE DEFAULT IS THE MAXIMUM, so a request without ?window= returns what it
+// returned before every read was bounded: the newest rows the table holds, and
+// no consumer has to change. The bound still matters with no window named: it
+// is on TimestampTime, the primary-key and partition column, so the read skips
+// any part older than 7 days that TTL has not merged away yet, and no query
+// without a time bound can be built. What keeps the default cheap is the
+// stepped plan below (1h, 24h, then 168h, stopping at the first window that
+// fills the limit) and, for a scoped read, the prunable namespace predicate. A
+// caller that wants less history, or a cheaper read of a sparse unscoped
+// composition, passes a narrower ?window=.
 const (
-	defaultEventsWindow       = 24 * time.Hour
+	defaultEventsWindow       = 7 * 24 * time.Hour
 	defaultEventsMaxWindow    = 7 * 24 * time.Hour
 	defaultEventsQueryTimeout = 4 * time.Second
+	// defaultAuditQueryTimeout bounds one /audit read. It is longer than the
+	// /events one because /audit has no partial answer to give: a deadline is
+	// a 500. krateo_audit is small (2,683 rows on krateo-057, 2026-11-10), so
+	// a healthy read takes milliseconds and only a saturated ClickHouse comes
+	// near it. It stays below snowplow's 10s upstream timeout.
+	defaultAuditQueryTimeout = 8 * time.Second
 )
 
 // eventsWindowSteps are the narrower windows /events tries, newest first,
@@ -971,6 +1084,10 @@ func handleEvents(cfg config, client *http.Client, scoper *rbacScoper) http.Hand
 
 		scope, err := resolveRequestScope(r, scoper)
 		if err != nil {
+			if callerGone(r) {
+				answerCallerGone(w, r, "events", err)
+				return
+			}
 			// Fail closed: no scope ⇒ no data.
 			slogErrorCtx(ctx, "events", "rbac scope resolution failed", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
@@ -1007,6 +1124,12 @@ func handleEvents(cfg config, client *http.Client, scoper *rbacScoper) http.Hand
 		defer cancel()
 		res, err := queryEventsWindowed(qctx, client, cfg, r.URL.Query(), scope, now, window)
 		if err != nil {
+			// The caller went away: not our deadline (queryEventsWindowed turns
+			// that into a partial answer), and not a ClickHouse failure.
+			if callerGone(r) {
+				answerCallerGone(w, r, "events", err)
+				return
+			}
 			slogErrorCtx(ctx, "events", "clickhouse query failed", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return

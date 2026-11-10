@@ -21,7 +21,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -135,47 +134,17 @@ func buildAuditQuery(q url.Values, scope *nsScope, since int64) (string, map[str
 }
 
 // queryAuditRecords runs the audit query and parses the JSONEachRow response.
-// The ClickHouse round-trip mirrors queryClickHouse (same endpoint, param
-// binding and basic-auth); kept separate so the /events path is untouched.
+//
+// It goes through postClickHouse, the round trip /events uses, so an audit read
+// carries the same server-side settings: readonly=2,
+// cancel_http_readonly_queries_on_client_close=1 and, under handleAudit's
+// deadline, max_execution_time. Before, it had its own round trip with none of
+// them, so an /audit read abandoned by its caller ran to completion on
+// ClickHouse, the defect /events had (see queryClickHouse).
 func queryAuditRecords(ctx context.Context, client *http.Client, cfg config, query string, params map[string]string) ([]AuditRecord, error) {
-	if client == nil {
-		client = http.DefaultClient
-	}
-	endpoint := cfg.clickhouseURL
-	if len(params) > 0 {
-		u, err := url.Parse(cfg.clickhouseURL)
-		if err != nil {
-			return nil, fmt.Errorf("parse clickhouse url: %w", err)
-		}
-		qp := u.Query()
-		for k, v := range params {
-			qp.Set("param_"+k, v)
-		}
-		u.RawQuery = qp.Encode()
-		endpoint = u.String()
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(query))
+	body, err := postClickHouse(ctx, client, cfg, query, params)
 	if err != nil {
 		return nil, err
-	}
-	req.Header.Set("Content-Type", "text/plain")
-	if cfg.clickhouseUser != "" {
-		req.SetBasicAuth(cfg.clickhouseUser, cfg.clickhousePassword)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("http request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("clickhouse returned %d: %s", resp.StatusCode, body)
 	}
 
 	rows := make([]AuditRecord, 0)
@@ -230,6 +199,10 @@ func handleAudit(cfg config, client *http.Client, scoper *rbacScoper) http.Handl
 
 		scope, err := resolveRequestScope(r, scoper)
 		if err != nil {
+			if callerGone(r) {
+				answerCallerGone(w, r, "audit", err)
+				return
+			}
 			// Fail closed: no scope ⇒ no data.
 			slogErrorCtx(ctx, "audit", "rbac scope resolution failed", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
@@ -253,8 +226,19 @@ func handleAudit(cfg config, client *http.Client, scoper *rbacScoper) http.Handl
 			return
 		}
 
-		rows, err := queryAuditRecords(ctx, client, cfg, query, params)
+		// One deadline for the query, below the caller's upstream timeout.
+		// postClickHouse turns it into ClickHouse's max_execution_time, so
+		// ClickHouse stops when this handler stops waiting. Unlike /events
+		// there is no narrower answer to fall back to, so a deadline is
+		// still a 500, as any failure was before.
+		qctx, cancel := context.WithTimeout(ctx, cfg.auditQueryTimeout())
+		defer cancel()
+		rows, err := queryAuditRecords(qctx, client, cfg, query, params)
 		if err != nil {
+			if callerGone(r) {
+				answerCallerGone(w, r, "audit", err)
+				return
+			}
 			slogErrorCtx(ctx, "audit", "clickhouse query failed", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
