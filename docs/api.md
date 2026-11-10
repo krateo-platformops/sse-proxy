@@ -41,7 +41,8 @@ The deadline is `EVENTS_QUERY_TIMEOUT` (default `4s`) for all of one request's C
 work. It sits below snowplow's 10 s upstream timeout, so a slow ClickHouse produces a `200`
 with `X-Events-Status: timeout` or `partial` instead of a cut-off request and a `5xx`.
 A caller that goes away before the answer gets `499` (client closed request), logged at INFO
-as `caller canceled`: it is not a server error, so the server span stays `Unset`.
+as `caller canceled`: it is not a server error, so the server span stays `Unset`, and so does
+the aborted ClickHouse client span, which carries `sse_proxy.caller_canceled=true`.
 ClickHouse stops at the same time: every query carries `max_execution_time` (the time left)
 and `cancel_http_readonly_queries_on_client_close=1` with `readonly=2`. A deadline is logged
 at most once a minute, with the number of suppressed occurrences. Any other ClickHouse
@@ -124,7 +125,7 @@ reconstructs the shape from the flattened ClickHouse row.
 | malformed `composition_id` or `window` | `400` |
 | `/events` deadline (`EVENTS_QUERY_TIMEOUT`) | `200` with `X-Events-Status: partial` or `timeout` (above) |
 | `/audit` deadline (`AUDIT_QUERY_TIMEOUT`) | `500`, like any `/audit` ClickHouse failure |
-| the caller went away (`/events`, `/audit`) | `499`, INFO `caller canceled`; no ERROR line, server span `Unset` |
+| the caller went away (`/events`, `/audit`) | `499`, INFO `caller canceled`; no ERROR line; server span and ClickHouse client span `Unset`, the client span with `sse_proxy.caller_canceled=true` |
 | ClickHouse or RBAC-scope resolution error | `500` (fail closed — a scoping error never widens access) |
 
 ## Metrics (when `OTEL_METRICS_ENABLED`)

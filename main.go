@@ -49,6 +49,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
 )
 
 // ---------------------------------------------------------------------------
@@ -579,12 +580,10 @@ func isQueryTimeout(ctx context.Context, err error) bool {
 // otelhttp server span got status Error. A 4xx server span is Unset by semconv,
 // so with 499 the server span records the code without claiming a failure.
 //
-// What 499 does NOT change: the aborted ClickHouse request's CLIENT span
-// (otelhttp transport, when tracing is on) still ends with status Error
-// "context canceled", because otelhttp marks every transport error that way;
-// and the tail sampler's http-status-400-or-more rule keeps any span with a
-// status code >= 400, 499 included. So such traces are still sampled; only the
-// server span stops reporting them as server errors.
+// The aborted ClickHouse request's CLIENT span is handled in clientspan.go: it
+// stays Unset with sse_proxy.caller_canceled=true, where otelhttp alone would
+// end it Error "context canceled". Whether the tail sampler keeps a 499 trace
+// is decided by its own rules (the observability chart), not here.
 const statusClientClosedRequest = 499
 
 // callerGone reports whether the request's own context was canceled, which
@@ -1316,9 +1315,12 @@ func main() {
 	// wrap the transport with otelhttp so calls to ClickHouse are client-spanned
 	// and propagate the W3C traceparent; otherwise use the default transport
 	// unchanged.
+	//
+	// The tracer provider is wrapped so a request aborted because the caller
+	// went away ends its client span Unset, not Error (clientspan.go).
 	outboundClient := &http.Client{}
 	if tel.tracingEnabled {
-		outboundClient.Transport = otelhttp.NewTransport(http.DefaultTransport)
+		outboundClient.Transport = newOutboundTransport(http.DefaultTransport, otel.GetTracerProvider())
 	}
 
 	p := newPoller(cfg, h, metrics, outboundClient)

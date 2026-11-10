@@ -44,9 +44,10 @@ Released together (1.5.0):
   omitted, so rows from before 1.0.8 give `{id}`. `compositionId` stays.
 - **A caller that goes away gets 499, not 500.** It was logged at ERROR as
   `clickhouse query failed` and the server span had status Error. Now it is an INFO
-  `caller canceled`, and a 4xx server span is `Unset`. The trace is still sampled: the aborted
-  ClickHouse client span ends with status Error (otelhttp marks every transport error so), and
-  the tail sampler keeps any span with a status code >= 400.
+  `caller canceled`, and a 4xx server span is `Unset`. The aborted ClickHouse client span is
+  `Unset` too, with `sse_proxy.caller_canceled=true`: otelhttp alone ends it Error
+  "context canceled", so the trace read as a backend failure. Our own deadline and real
+  ClickHouse failures stay Error.
 - **Auth 503s are logged.** An unreachable JWKS or an unknown `kid` answered 503 with no log
   line. Now each logs a WARN with the reason and the `kid` (never the token), at most once a
   minute per reason.
