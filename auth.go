@@ -27,6 +27,7 @@ package main
 
 import (
 	"context"
+	"crypto/rsa"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -74,6 +75,9 @@ type authConfig struct {
 	// from when no Authorization header is present (matches snowplow's
 	// REFRESH_SESSION_COOKIE, default "krateo-session").
 	sessionCookie string
+	// keyLog rate-limits the warning logged for each 503 (see
+	// logKeyUnavailable). Nil uses a process-wide one.
+	keyLog *keyUnavailableLog
 }
 
 const (
@@ -125,6 +129,7 @@ func loadAuthConfig() (authConfig, error) {
 		keys:          keys,
 		jwksURL:       jwksURL,
 		sessionCookie: getEnv(envSessionCookie, defaultSessionCookie),
+		keyLog:        newKeyUnavailableLog(),
 	}, nil
 }
 
@@ -176,22 +181,113 @@ func (a authConfig) tokenFromRequestHeaderOrCookie(r *http.Request) (string, boo
 // validate verifies the token exactly as snowplow does: stateless RS256
 // signature verification, resolving authn's public key by the token's "kid"
 // through the JWKS key source (5s leeway, exp enforced; iss/aud not checked).
-// The returned UserInfo carries the username + groups from the verified claims.
-func (a authConfig) validate(token string) (jwtutil.UserInfo, error) {
-	return jwtutil.ValidateWithKeySource(a.keys, token)
+// The returned UserInfo carries the username + groups from the verified claims,
+// and kid is the "kid" the token asked the key source for ("" when the token
+// has none, or was refused before a key was looked up).
+func (a authConfig) validate(token string) (ui jwtutil.UserInfo, kid string, err error) {
+	rec := &kidRecorder{inner: a.keys}
+	ui, err = jwtutil.ValidateWithKeySource(rec, token)
+	return ui, rec.kid, err
+}
+
+// kidRecorder passes key lookups through to the real key source and keeps the
+// kid asked for, so a 503 can name it without this proxy parsing the token
+// itself. One is made per validation, so it needs no lock.
+type kidRecorder struct {
+	inner jwtutil.KeySource
+	kid   string
+}
+
+func (k *kidRecorder) PublicKey(kid string) (*rsa.PublicKey, error) {
+	k.kid = kid
+	return k.inner.PublicKey(kid)
 }
 
 // writeAuthError maps a validation failure to the right status. A token fault
 // (expired/invalid) is 401. An inability to obtain authn's key (JWKS
 // unreachable / unknown kid) is a transient 503 that says nothing about the
 // token — mirroring snowplow, so an authn outage does not masquerade as a bad
-// credential.
-func writeAuthError(w http.ResponseWriter, err error) {
+// credential. The 503 is also logged (logKeyUnavailable): it is our fault, and
+// before it was logged nowhere.
+func (a authConfig) writeAuthError(w http.ResponseWriter, r *http.Request, kid string, err error) {
 	if errors.Is(err, jwtutil.ErrKeyUnavailable) {
+		a.logKeyUnavailable(r, kid, err)
 		_ = response.ServiceUnavailable(w, err)
 		return
 	}
 	_ = response.Unauthorized(w, err)
+}
+
+// Reasons a token's signing key was unavailable, as logged.
+const (
+	// keyReasonUnknownKid: the key set was fetched (or could not be refetched
+	// yet) and holds no key for the token's kid, or the token has no kid and
+	// the set holds more than one key. Usually a token signed by another authn,
+	// or authn rotated its key and the set has not caught up.
+	keyReasonUnknownKid = "unknown_kid"
+	// keyReasonJWKSUnavailable: the key set could not be fetched or read
+	// (authn unreachable, a non-200, a malformed or empty document).
+	keyReasonJWKSUnavailable = "jwks_unavailable"
+)
+
+// keyUnavailableReason tells an unknown kid from a key set that could not be
+// fetched. plumbing's jwtutil exports one sentinel for both, so this reads the
+// cause it wraps; anything it does not recognise as an unknown kid counts as
+// the key set being unavailable, the case that needs an operator.
+func keyUnavailableReason(err error) string {
+	msg := err.Error()
+	if strings.Contains(msg, "holds no key for kid") || strings.Contains(msg, "token has no kid to select one") {
+		return keyReasonUnknownKid
+	}
+	return keyReasonJWKSUnavailable
+}
+
+// keyUnavailableLog holds one throttle per reason, so a JWKS outage that
+// answers every request with 503 is logged once a minute with a count, and an
+// unknown kid does not hide a fetch failure (or the reverse).
+type keyUnavailableLog struct {
+	byReason map[string]*logThrottle
+}
+
+func newKeyUnavailableLog() *keyUnavailableLog {
+	return &keyUnavailableLog{byReason: map[string]*logThrottle{
+		keyReasonUnknownKid:      newLogThrottle(time.Minute),
+		keyReasonJWKSUnavailable: newLogThrottle(time.Minute),
+	}}
+}
+
+// defaultKeyUnavailableLog serves an authConfig built without one (tests that
+// do not look at the log).
+var defaultKeyUnavailableLog = newKeyUnavailableLog()
+
+// maxLoggedKidLen caps the kid on the log line: it comes from the token header,
+// which the caller controls.
+const maxLoggedKidLen = 64
+
+// maxLoggedErrLen caps the cause on the log line, which repeats the kid.
+const maxLoggedErrLen = 512
+
+// logKeyUnavailable writes the WARN for a 503: the reason, the kid and the
+// cause (the JWKS URL and, for an unknown kid, the kid; plumbing's messages
+// carry no token material). It NEVER logs the token, nor anything derived from
+// it but the kid.
+func (a authConfig) logKeyUnavailable(r *http.Request, kid string, err error) {
+	kl := a.keyLog
+	if kl == nil {
+		kl = defaultKeyUnavailableLog
+	}
+	reason := keyUnavailableReason(err)
+	ok, suppressed := kl.byReason[reason].allow(time.Now())
+	if !ok {
+		return
+	}
+	slogWarnCtx(r.Context(), "sse-proxy", "token signing key unavailable; answered 503",
+		slog.String("reason", reason),
+		slog.String("kid", truncate(kid, maxLoggedKidLen)),
+		slog.String("route", r.Pattern),
+		slog.String("error", truncate(err.Error(), maxLoggedErrLen)),
+		slog.Int64("suppressed_since_last_log", suppressed),
+	)
 }
 
 // queryTokenParam returns the name of a query parameter that could carry a token, or
@@ -237,11 +333,11 @@ func (a authConfig) requireBearer(next http.HandlerFunc) http.HandlerFunc {
 			_ = response.Unauthorized(w, fmt.Errorf("missing or malformed Authorization header, and no session cookie"))
 			return
 		}
-		ui, err := a.validate(token)
+		ui, kid, err := a.validate(token)
 		if err != nil {
 			// 401 for a token fault, 503 for an unavailable key — both carry no
 			// token material.
-			writeAuthError(w, err)
+			a.writeAuthError(w, r, kid, err)
 			return
 		}
 		next(w, r.WithContext(withUserInfo(r.Context(), ui)))

@@ -233,7 +233,7 @@ func TestScopeFor_FailsClosedOnAPIError(t *testing.T) {
 
 func TestBuildEventsQuery_ScopedAddsNamespacePredicate(t *testing.T) {
 	scope := &nsScope{namespaces: []string{"team-a", "team-b"}}
-	q, params, err := buildEventsQuery(url.Values{}, scope)
+	q, params, err := buildEventsQuery(url.Values{}, scope, testSince)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -255,7 +255,7 @@ func TestBuildEventsQuery_UnscopedOmitsNamespacePredicate(t *testing.T) {
 		"allowAll (cluster admin)":     {allowAll: true},
 	} {
 		t.Run(name, func(t *testing.T) {
-			q, params, err := buildEventsQuery(url.Values{}, scope)
+			q, params, err := buildEventsQuery(url.Values{}, scope, testSince)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -272,7 +272,7 @@ func TestBuildEventsQuery_UnscopedOmitsNamespacePredicate(t *testing.T) {
 func TestBuildEventsQuery_ScopeAndCompositionCompose(t *testing.T) {
 	cid := "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
 	scope := &nsScope{namespaces: []string{"team-a"}}
-	q, params, err := buildEventsQuery(mustValues(t, "composition_id="+cid), scope)
+	q, params, err := buildEventsQuery(mustValues(t, "composition_id="+cid), scope, testSince)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

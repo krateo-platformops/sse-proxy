@@ -50,7 +50,7 @@ func mustValues(t *testing.T, raw string) url.Values {
 }
 
 func TestBuildEventsQuery_NoParams(t *testing.T) {
-	q, params, err := buildEventsQuery(url.Values{}, nil)
+	q, params, err := buildEventsQuery(url.Values{}, nil, testSince)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestBuildEventsQuery_NoParams(t *testing.T) {
 
 func TestBuildEventsQuery_WithValidComposition(t *testing.T) {
 	cid := "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
-	q, params, err := buildEventsQuery(mustValues(t, "composition_id="+cid+"&limit=10"), nil)
+	q, params, err := buildEventsQuery(mustValues(t, "composition_id="+cid+"&limit=10"), nil, testSince)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestBuildEventsQuery_RejectsNonUUIDCompositionID(t *testing.T) {
 		t.Run(b, func(t *testing.T) {
 			v := url.Values{}
 			v.Set("composition_id", b)
-			if _, _, err := buildEventsQuery(v, nil); err == nil {
+			if _, _, err := buildEventsQuery(v, nil, testSince); err == nil {
 				t.Fatalf("expected error for invalid composition_id %q, got nil", b)
 			}
 		})
@@ -109,7 +109,7 @@ func TestBuildEventsQuery_RejectsNonUUIDCompositionID(t *testing.T) {
 }
 
 func TestBuildEventsQuery_ClampsLimit(t *testing.T) {
-	_, params, err := buildEventsQuery(mustValues(t, "limit=999999"), nil)
+	_, params, err := buildEventsQuery(mustValues(t, "limit=999999"), nil, testSince)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -269,7 +269,7 @@ func TestTokenFromRequest_NoQueryToken(t *testing.T) {
 // If that regresses, this endpoint silently serves half a feed.
 func TestBuildEventsQuery_CompositionIncludesOwnAndChildren(t *testing.T) {
 	cid := "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
-	q, params, err := buildEventsQuery(mustValues(t, "composition_id="+cid), nil)
+	q, params, err := buildEventsQuery(mustValues(t, "composition_id="+cid), nil, testSince)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestBuildEventsQuery_CompositionIncludesOwnAndChildren(t *testing.T) {
 func TestBuildEventsQuery_ScopeCannotLeakThroughPrecedence(t *testing.T) {
 	cid := "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
 	scope := &nsScope{namespaces: []string{"team-a"}}
-	q, _, err := buildEventsQuery(mustValues(t, "composition_id="+cid), scope)
+	q, _, err := buildEventsQuery(mustValues(t, "composition_id="+cid), scope, testSince)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -334,7 +334,7 @@ func TestBuildEventsQuery_ScopeCannotLeakThroughPrecedence(t *testing.T) {
 // events, against 0.42s map-only).
 func TestBuildEventsQuery_CompositionPredicateIsMapOnly(t *testing.T) {
 	cid := "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
-	q, params, err := buildEventsQuery(mustValues(t, "composition_id="+cid), nil)
+	q, params, err := buildEventsQuery(mustValues(t, "composition_id="+cid), nil, testSince)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -370,7 +370,7 @@ func TestBuildEventsQuery_NoStaleTokenParam(t *testing.T) {
 		url.Values{},
 		mustValues(t, "composition_id=1b4e28ba-2fa1-11d2-883f-0016d3cca427"),
 	} {
-		sql, params, err := buildEventsQuery(q, nil)
+		sql, params, err := buildEventsQuery(q, nil, testSince)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

@@ -4,12 +4,65 @@ title: sse-proxy — log
 description: Curated chronological history — notable changes, decisions and incidents; release notes stay in GitHub Releases.
 resource: ghcr.io/krateo-platformops/sse-proxy
 tags: [history]
-timestamp: 2026-08-07T00:00:00Z
+timestamp: 2026-11-10T00:00:00Z
 ---
 
 # Log
 
 Curated history, newest first.
+
+## 2026-11-10 — 1.5.0: /events is bounded, prunable, and answers before its caller gives up
+A load test on krateo-057 timed out nearly every `/events` read from about 70 req/s of portal
+traffic, and surfaced them as snowplow 5xx from about 310 req/s. Two causes:
+
+- A scoped read of a quiet namespace never filled `limit`, so it widened 1h → 24h → unbounded.
+  The namespace filter was a JSON extraction over `Body`, which cannot prune, so the last step
+  parsed every k8s-events row in the table. Measured per request: 3 queries, 246 granules,
+  ~1.47M rows, 1.66 GiB, ~3.7 CPU-s on an idle ClickHouse.
+- Nothing bounded the query on the server. 2,438 reads ran past the 10 s at which snowplow had
+  given up, up to 64 s, and all of them ran to completion.
+
+Now every read is time-bounded (`?window=`, default and max 168h, `otel_logs`' TTL, on the
+primary-key column). A scoped read also filters on `ResourceAttributes['k8s.namespace.name']`,
+which a bloom index can prune, and keeps the exact JSON predicate. The same request costs 3
+queries, 3 granules, ~46k rows, 22 MiB and ~138 CPU-ms (2 queries and ~76 CPU-ms with a
+`window=24h`), with byte-identical rows. A 4 s deadline (`EVENTS_QUERY_TIMEOUT`) answers `200`
+with `X-Events-Status: partial|timeout` instead of letting the caller time out. ClickHouse stops
+at the same deadline (`max_execution_time`, and cancel-on-close with `readonly=2`).
+
+The proposal defaulted the window to 24h. Diego set it to 168h (2026-11-10), so an `/events`
+call without `window` returns what it did before and no consumer changes. It matters: on
+krateo-057 a `kube-system`-scoped read had no events in the last 24h and 200 in the last 7 days,
+so a 24h default would have turned a full panel into an empty one.
+
+Released together (1.5.0):
+
+- **Composition on each event.** `/events` and the `/notifications` stream add
+  `composition: {id, namespace, name}`, from `krateo.io/composition-name` and
+  `krateo.io/composition-namespace`, which otel-collector 1.0.8 writes next to
+  `krateo.io/composition-id`. The object appears only with an id, and empty name/namespace are
+  omitted, so rows from before 1.0.8 give `{id}`. `compositionId` stays.
+- **A caller that goes away gets 499, not 500.** It was logged at ERROR as
+  `clickhouse query failed` and the server span had status Error. Now it is an INFO
+  `caller canceled`, and a 4xx server span is `Unset`. The aborted ClickHouse client span is
+  `Unset` too, with `sse_proxy.caller_canceled=true`: otelhttp alone ends it Error
+  "context canceled", so the trace read as a backend failure. Our own deadline and real
+  ClickHouse failures stay Error.
+- **Auth 503s are logged.** An unreachable JWKS or an unknown `kid` answered 503 with no log
+  line. Now each logs a WARN with the reason and the `kid` (never the token), at most once a
+  minute per reason.
+- **`/audit` stops on the server too.** It had its own ClickHouse round trip with none of the
+  settings above. It now shares `/events`' round trip (`readonly=2`, cancel-on-close,
+  `max_execution_time`) under an 8 s deadline (`AUDIT_QUERY_TIMEOUT`); a deadline is a 500, as
+  any failure was.
+- **`/audit` returns six fields it always dropped.** `resourceGroup`, `resourceVersion`,
+  `resourceName`, `statusCode`, `traceId` and `sessionId` were always empty: their SELECT aliases
+  were snake_case (`status_code`, …) and `AuditRecord`'s JSON keys are camelCase, which
+  encoding/json does not match. The aliases now equal the keys, and a test keeps them so. On
+  krateo-057's newest 200 audit rows the fields now carry values (`statusCode` 200, `traceId`
+  175, `resourceName` 195). No consumer depended on the empty values: no RESTAction on 057 calls
+  sse-proxy's `/audit` (the portal's `audit-records` queries ClickHouse directly), and
+  `query_log` holds no sse-proxy audit query since 2026-11-08.
 
 ## 2026-11-05 — query-string tokens refused, and CORS preflights answered
 `?access_token=` and `?token=` are gone (#40, installer#395). They existed because

@@ -4,7 +4,7 @@ title: sse-proxy — overview
 description: How the SSE proxy works — the ClickHouse poller, the in-memory fan-out hub, topics, RS256/JWKS JWT auth, RBAC-derived tenant scoping, and gated OTel.
 resource: ghcr.io/krateo-platformops/sse-proxy
 tags: [architecture, sse, clickhouse, events]
-timestamp: 2026-08-07T00:00:00Z
+timestamp: 2026-11-10T00:00:00Z
 ---
 
 # Overview
@@ -92,7 +92,9 @@ so the key source is normally always built. If a JWKS source can't be resolved �
 never serve unauthenticated (`auth.go`). For a local dev harness, point `URL_AUTHN` /
 `JWT_JWKS_URL` at a fake JWKS server instead of trying to disable auth. A token fault
 (expired/invalid) is a **401**; an unreachable JWKS endpoint or unknown `kid` is a
-transient **503** that says nothing about the token.
+transient **503** that says nothing about the token. Each 503 is logged as a WARN with the
+reason (`jwks_unavailable` or `unknown_kid`) and the `kid`, never the token, at most once a
+minute per reason.
 
 ## Multi-tenant scoping (opt-in, `main`-only for now)
 
