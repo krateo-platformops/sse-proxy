@@ -42,22 +42,29 @@ const (
 // auditSQLTemplate reads krateo_audit (the OTel logs schema the collector's
 // clickhouse/audit exporter writes). The audit semconv attributes live in the
 // LogAttributes map; TraceId/Timestamp are columns. Newest-first, limit bound.
+//
+// EACH ALIAS IS THE JSON KEY OF AN AuditRecord FIELD, spelled exactly: the
+// JSONEachRow row is decoded straight into AuditRecord, and encoding/json
+// ignores case but not underscores. Until 1.5.0 six aliases were snake_case
+// (resource_group, resource_version, resource_name, status_code, trace_id,
+// session_id), so those fields were always empty in /audit responses.
+// TestAuditSQLAliasesMatchRecordKeys keeps the two in step.
 const auditSQLTemplate = `SELECT
     formatDateTime(toDateTime(Timestamp), '%Y-%m-%dT%H:%i:%SZ', 'UTC')        AS timestamp,
     ifNull(nullIf(LogAttributes['user.name'], ''), LogAttributes['enduser.id']) AS user,
     ifNull(LogAttributes['user.roles'], '')                                   AS roles,
     ifNull(LogAttributes['krateo.action'], '')                                AS action,
     ifNull(LogAttributes['http.request.method'], '')                          AS verb,
-    ifNull(LogAttributes['k8s.resource.group'], '')                           AS resource_group,
-    ifNull(LogAttributes['k8s.resource.version'], '')                         AS resource_version,
+    ifNull(LogAttributes['k8s.resource.group'], '')                           AS resourceGroup,
+    ifNull(LogAttributes['k8s.resource.version'], '')                         AS resourceVersion,
     ifNull(LogAttributes['k8s.resource.resource'], '')                        AS resource,
-    ifNull(LogAttributes['k8s.resource.name'], '')                            AS resource_name,
+    ifNull(LogAttributes['k8s.resource.name'], '')                            AS resourceName,
     ifNull(LogAttributes['k8s.namespace.name'], '')                           AS namespace,
     ifNull(LogAttributes['outcome'], '')                                      AS outcome,
-    ifNull(LogAttributes['http.response.status_code'], '')                    AS status_code,
+    ifNull(LogAttributes['http.response.status_code'], '')                    AS statusCode,
     Body                                                                      AS message,
-    TraceId                                                                   AS trace_id,
-    ifNull(LogAttributes['session.id'], '')                                   AS session_id
+    TraceId                                                                   AS traceId,
+    ifNull(LogAttributes['session.id'], '')                                   AS sessionId
 FROM krateo_audit
 WHERE LogAttributes['event.name'] = 'audit'/*NAMESPACE_PREDICATE*//*WINDOW_PREDICATE*/
 ORDER BY Timestamp DESC

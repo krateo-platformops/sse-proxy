@@ -55,6 +55,14 @@ Released together (1.5.0):
   settings above. It now shares `/events`' round trip (`readonly=2`, cancel-on-close,
   `max_execution_time`) under an 8 s deadline (`AUDIT_QUERY_TIMEOUT`); a deadline is a 500, as
   any failure was.
+- **`/audit` returns six fields it always dropped.** `resourceGroup`, `resourceVersion`,
+  `resourceName`, `statusCode`, `traceId` and `sessionId` were always empty: their SELECT aliases
+  were snake_case (`status_code`, …) and `AuditRecord`'s JSON keys are camelCase, which
+  encoding/json does not match. The aliases now equal the keys, and a test keeps them so. On
+  krateo-057's newest 200 audit rows the fields now carry values (`statusCode` 200, `traceId`
+  175, `resourceName` 195). No consumer depended on the empty values: no RESTAction on 057 calls
+  sse-proxy's `/audit` (the portal's `audit-records` queries ClickHouse directly), and
+  `query_log` holds no sse-proxy audit query since 2026-11-08.
 
 ## 2026-11-05 — query-string tokens refused, and CORS preflights answered
 `?access_token=` and `?token=` are gone (#40, installer#395). They existed because
