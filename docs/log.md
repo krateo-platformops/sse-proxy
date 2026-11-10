@@ -11,6 +11,26 @@ timestamp: 2026-08-07T00:00:00Z
 
 Curated history, newest first.
 
+## 2026-11-10 — /events is bounded, prunable, and answers before its caller gives up
+A load test on krateo-057 timed out nearly every `/events` read from about 70 req/s of portal
+traffic, and surfaced them as snowplow 5xx from about 310 req/s. Two causes:
+
+- A scoped read of a quiet namespace never filled `limit`, so it widened 1h → 24h → unbounded.
+  The namespace filter was a JSON extraction over `Body`, which cannot prune, so the last step
+  parsed every k8s-events row in the table. Measured per request: 3 queries, 246 granules,
+  ~1.47M rows, 1.66 GiB, ~3.7 CPU-s on an idle ClickHouse.
+- Nothing bounded the query on the server. 2,438 reads ran past the 10 s at which snowplow had
+  given up, up to 64 s, and all of them ran to completion.
+
+Now every read is time-bounded (`?window=`, default 24h, max 168h, on the primary-key column).
+A scoped read also filters on `ResourceAttributes['k8s.namespace.name']`, which a bloom index
+can prune, and keeps the exact JSON predicate. The same request costs 2 queries, 2 granules,
+~30k rows, 14 MiB and ~76 CPU-ms, with byte-identical rows. A 4 s deadline
+(`EVENTS_QUERY_TIMEOUT`) answers `200` with `X-Events-Status: partial|timeout` instead of
+letting the caller time out. ClickHouse stops at the same deadline (`max_execution_time`, and
+cancel-on-close with `readonly=2`). Behaviour change: an `/events` call without `window` no
+longer returns events older than 24h.
+
 ## 2026-11-05 — query-string tokens refused, and CORS preflights answered
 `?access_token=` and `?token=` are gone (#40, installer#395). They existed because
 `EventSource` cannot set headers, and a token in a URL reaches access logs and spans. A request

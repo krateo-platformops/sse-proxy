@@ -20,6 +20,13 @@ Grouped by the file that reads them.
 | `CLICKHOUSE_USER` | `default` | ClickHouse basic-auth user |
 | `CLICKHOUSE_PASSWORD` | empty | ClickHouse basic-auth password (chart: from the `clickhouse-credentials` Secret, optional) |
 | `LISTEN_ADDR` | `:8080` | listen address |
+| `EVENTS_QUERY_TIMEOUT` | `4s` | deadline for one `/events` request's ClickHouse work, all windows together (Go duration). Keep it below the caller's upstream timeout (snowplow: 10 s), or the caller gives up first and the client gets a `5xx` instead of a partial answer |
+| `EVENTS_DEFAULT_WINDOW` | `24h` | window of an `/events` request without `?window=` (Go duration; never above `EVENTS_MAX_WINDOW`) |
+| `EVENTS_MAX_WINDOW` | `168h` | widest window an `/events` request may ask for (Go duration). `168h` matches `otel_logs`' 7-day TTL |
+
+Every ClickHouse query sets `readonly=2`, `cancel_http_readonly_queries_on_client_close=1`
+and, when it has a deadline, `max_execution_time`. The ClickHouse user must therefore be
+allowed to change settings (`readonly` 0 or 2); a `readonly=1` user refuses these queries.
 
 ## Logging (`logging.go`)
 
