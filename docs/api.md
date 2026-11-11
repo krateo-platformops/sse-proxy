@@ -4,7 +4,7 @@ title: sse-proxy — API
 description: The HTTP/SSE contract — /events, /notifications, /health, the SSEK8sEvent payload, token acceptance and injection-safety guarantees.
 resource: ghcr.io/krateo-platformops/sse-proxy
 tags: [api, http, sse]
-timestamp: 2026-11-10T00:00:00Z
+timestamp: 2026-11-11T00:00:00Z
 ---
 
 # API
@@ -38,8 +38,13 @@ say how complete it is; both are listed in `Access-Control-Expose-Headers`.
 | `X-Events-Window` | seconds the body is a complete answer for: the requested window when `complete`, the narrower window when `partial`, `0` when `timeout` |
 
 The deadline is `EVENTS_QUERY_TIMEOUT` (default `4s`) for all of one request's ClickHouse
-work. It sits below snowplow's 10 s upstream timeout, so a slow ClickHouse produces a `200`
-with `X-Events-Status: timeout` or `partial` instead of a cut-off request and a `5xx`.
+work, inside an end-to-end `EVENTS_REQUEST_TIMEOUT` (default `8s`) that also covers the RBAC
+scope resolution before it. When the resolution was slow, the ClickHouse work is cut to end
+100 ms before the request deadline. Both sit below snowplow's 10 s upstream timeout, so a slow
+ClickHouse or a slow scope resolution produces a `200` with `X-Events-Status: timeout` or
+`partial` instead of a cut-off request and a `5xx`. If the request deadline passes before the
+scope is resolved, the answer is `200` `[]` with `X-Events-Status: timeout` and
+`X-Events-Window: 0`, and no ClickHouse query runs: rows are never served without a scope.
 A caller that goes away before the answer gets `499` (client closed request), logged at INFO
 as `caller canceled`: it is not a server error, so the server span stays `Unset`, and so does
 the aborted ClickHouse client span, which carries `sse_proxy.caller_canceled=true`.
@@ -123,8 +128,8 @@ reconstructs the shape from the flattened ClickHouse row.
 | missing/invalid/expired JWT (auth on) | `401` (plumbing error shape; no token material echoed) |
 | authn's signing key unavailable (JWKS unreachable, or no key for the token's `kid`) | `503`, and a WARN `token signing key unavailable; answered 503` with `reason` (`jwks_unavailable` or `unknown_kid`) and the `kid`, at most once a minute per reason with a suppressed count. The token is never logged |
 | malformed `composition_id` or `window` | `400` |
-| `/events` deadline (`EVENTS_QUERY_TIMEOUT`) | `200` with `X-Events-Status: partial` or `timeout` (above) |
-| `/audit` deadline (`AUDIT_QUERY_TIMEOUT`) | `500`, like any `/audit` ClickHouse failure |
+| `/events` deadline (`EVENTS_QUERY_TIMEOUT`, or `EVENTS_REQUEST_TIMEOUT` during scope resolution) | `200` with `X-Events-Status: partial` or `timeout` (above); `timeout` with `[]` when the scope was not resolved in time |
+| `/audit` deadline (`AUDIT_QUERY_TIMEOUT`, or `AUDIT_REQUEST_TIMEOUT` including scope resolution) | `500`, like any `/audit` ClickHouse failure |
 | the caller went away (`/events`, `/audit`) | `499`, INFO `caller canceled`; no ERROR line; server span and ClickHouse client span `Unset`, the client span with `sse_proxy.caller_canceled=true` |
 | ClickHouse or RBAC-scope resolution error | `500` (fail closed — a scoping error never widens access) |
 

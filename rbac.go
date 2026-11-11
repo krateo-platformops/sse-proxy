@@ -26,7 +26,9 @@
 //
 // Results are cached per (username, groups) with a short TTL to keep the
 // SubjectAccessReview volume negligible; RBAC changes are picked up within
-// one TTL (and on SSE reconnect).
+// one TTL (and on SSE reconnect). Concurrent misses for the same key share ONE
+// resolution (see scopeFor), so a burst of requests from one identity after
+// its entry lapsed costs one fan-out, not one per request.
 //
 // The Kubernetes API is called with the proxy's own ServiceAccount using a
 // minimal stdlib HTTP client (no client-go — consistent with this repo's
@@ -50,6 +52,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -63,6 +66,9 @@ import (
 	"time"
 
 	"github.com/krateo-platformops/plumbing/jwtutil"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ---------------------------------------------------------------------------
@@ -102,6 +108,16 @@ const (
 
 	// sarConcurrency bounds the parallel per-namespace SubjectAccessReviews.
 	sarConcurrency = 8
+
+	// defaultScopeResolveTimeout bounds ONE shared scope resolution (see
+	// scopeFor). It runs detached from any single caller, so something else must
+	// stop it, and it is longer than any request's own deadline on purpose: a
+	// slow apiserver whose resolution outlives the requests that asked for it
+	// still fills the cache, so the next request for that identity is a hit. A
+	// bound at or below the request deadline would cancel it every time, and a
+	// resolution slower than that would never succeed. Each kube API call is
+	// also bounded by the client's own 10s timeout.
+	defaultScopeResolveTimeout = 30 * time.Second
 )
 
 // ---------------------------------------------------------------------------
@@ -232,12 +248,22 @@ func newInClusterKubeClient() (*kubeClient, error) {
 			Timeout: 10 * time.Second,
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+				// A resolution fans out sarConcurrency SARs at once. With the
+				// default of 2 idle connections per host, 6 of every 8 were
+				// closed after use and the next batch paid a new TCP+TLS
+				// handshake to the apiserver for each.
+				MaxIdleConnsPerHost: sarConcurrency,
 			},
 		},
 		tokenFile: saTokenPath,
 	}, nil
 }
 
+// do performs one kube API request. It opens no span of its own: its callers
+// (subjectAccessReview, listNamespaces) own one per operation, and do records
+// the response status on it. The span never carries the path's query (a list
+// continue token) or the request body (the SAR spec holds the caller's
+// identity).
 func (k *kubeClient) do(ctx context.Context, method, path string, body []byte) ([]byte, error) {
 	var rd io.Reader
 	if body != nil {
@@ -264,6 +290,7 @@ func (k *kubeClient) do(ctx context.Context, method, path string, body []byte) (
 		return nil, fmt.Errorf("kube api request: %w", err)
 	}
 	defer resp.Body.Close()
+	trace.SpanFromContext(ctx).SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
 	out, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read kube api response: %w", err)
@@ -283,7 +310,23 @@ func truncate(s string, n int) string {
 
 // subjectAccessReview asks the API server whether the given subject can
 // perform verb/resource (in namespace ns; empty ns = cluster-wide).
-func (k *kubeClient) subjectAccessReview(ctx context.Context, user string, groups []string, verb, apiGroup, resource, ns string) (bool, error) {
+//
+// Its span names the namespace and the outcome, NEVER the user or groups: the
+// identity must not reach spans.
+func (k *kubeClient) subjectAccessReview(ctx context.Context, user string, groups []string, verb, apiGroup, resource, ns string) (allowed bool, err error) {
+	attrs := []attribute.KeyValue{attribute.Bool("sse_proxy.rbac.sar.cluster_wide", ns == "")}
+	if ns != "" {
+		attrs = append(attrs, attribute.String("k8s.namespace.name", ns))
+	}
+	ctx, span := startSpan(ctx, "kube.subject_access_review",
+		trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
+	defer func() {
+		if err == nil {
+			span.SetAttributes(attribute.Bool("sse_proxy.rbac.sar.allowed", allowed))
+		}
+		endSpan(ctx, span, err)
+	}()
+
 	sar := map[string]any{
 		"apiVersion": "authorization.k8s.io/v1",
 		"kind":       "SubjectAccessReview",
@@ -318,10 +361,19 @@ func (k *kubeClient) subjectAccessReview(ctx context.Context, user string, group
 }
 
 // listNamespaces returns every namespace name in the cluster (paginated).
-func (k *kubeClient) listNamespaces(ctx context.Context) ([]string, error) {
-	var names []string
+func (k *kubeClient) listNamespaces(ctx context.Context) (names []string, err error) {
+	ctx, span := startSpan(ctx, "kube.list_namespaces", trace.WithSpanKind(trace.SpanKindClient))
+	pages := 0
+	defer func() {
+		span.SetAttributes(attribute.Int("sse_proxy.kube.pages", pages))
+		if err == nil {
+			span.SetAttributes(attribute.Int("sse_proxy.rbac.namespaces.listed", len(names)))
+		}
+		endSpan(ctx, span, err)
+	}()
 	cont := ""
 	for {
+		pages++
 		path := "/api/v1/namespaces?limit=500"
 		if cont != "" {
 			path += "&continue=" + url.QueryEscape(cont)
@@ -362,15 +414,33 @@ type scopeEntry struct {
 	expires time.Time
 }
 
+// scopeCall is one in-flight resolution, shared by every scopeFor call that
+// misses the cache for the same key while it runs. scope and err are written
+// once, before done is closed, and read only after it is.
+type scopeCall struct {
+	done  chan struct{}
+	scope *nsScope
+	err   error
+	// span is the resolution's own span, linked from the spans of the callers
+	// that joined it.
+	span trace.SpanContext
+}
+
 type rbacScoper struct {
 	kube     *kubeClient
 	verb     string
 	apiGroup string
 	resource string
 	ttl      time.Duration
+	// resolveTimeout bounds one shared resolution. Zero means
+	// defaultScopeResolveTimeout.
+	resolveTimeout time.Duration
 
 	mu    sync.Mutex
 	cache map[string]scopeEntry
+	// inflight holds the resolution running for each key, if any. Created on
+	// first use, so a struct literal without it works.
+	inflight map[string]*scopeCall
 }
 
 // loadRBACScoper returns nil when scoping is disabled. When enabled it
@@ -456,28 +526,128 @@ func cacheKey(u jwtutil.UserInfo) string {
 	return u.Username + "\x00" + strings.Join(u.Groups, "\x00")
 }
 
+// Values of the sse_proxy.rbac.cache span attribute on rbac.scope.
+const (
+	scopeCacheHit    = "hit"    // a fresh cache entry answered
+	scopeCacheMiss   = "miss"   // this call started the resolution
+	scopeCacheShared = "shared" // this call joined a resolution already running
+)
+
 // scopeFor returns the caller's namespace scope, from cache when fresh. Any
 // resolution error propagates to the caller, which must fail closed.
-func (s *rbacScoper) scopeFor(ctx context.Context, u jwtutil.UserInfo) (*nsScope, error) {
+//
+// ONE RESOLUTION PER KEY AT A TIME. Before 1.5.1 every miss ran resolve()
+// itself. On krateo-057 (2026-11-11, load step 25 -> 50 virtual users sharing
+// 3 identities) the cache entries had lapsed in an idle gap, so the burst of
+// /events that followed ran about 16 identical fan-outs per identity at once
+// (a cluster-wide SAR, a namespace list, a SAR per namespace each), and 31
+// requests took 11.8-12.8 s, past snowplow's 10 s, with ClickHouse idle. Now
+// the first miss starts the resolution and every concurrent miss for the same
+// key waits for that one.
+//
+// The shared resolution:
+//   - runs on a context detached from every caller (context.WithoutCancel of
+//     the first one's, for its trace and values) under its own bound
+//     (resolveTimeout). One caller leaving must not fail everyone who joined.
+//   - is cached only on success. An error is returned to everyone waiting for
+//     it and then forgotten, so the next call resolves again.
+//
+// Each caller waits under its OWN ctx: when that ends, it returns ctx.Err()
+// at once and the resolution carries on for the others.
+//
+// The cache key is the identity only (see loadAuditScoper), so the in-flight
+// map lives on the scoper next to its cache: a diverging audit scoper has its
+// own of both, and never joins an events resolution.
+func (s *rbacScoper) scopeFor(ctx context.Context, u jwtutil.UserInfo) (scope *nsScope, err error) {
+	ctx, span := startSpan(ctx, "rbac.scope")
+	defer func() {
+		if err == nil {
+			setScopeAttrs(span, scope)
+		}
+		endSpan(ctx, span, err)
+	}()
+
 	key := cacheKey(u)
-	now := time.Now()
 
 	s.mu.Lock()
-	if e, ok := s.cache[key]; ok && now.Before(e.expires) {
+	if e, ok := s.cache[key]; ok && time.Now().Before(e.expires) {
 		s.mu.Unlock()
+		span.SetAttributes(attribute.String("sse_proxy.rbac.cache", scopeCacheHit))
 		return e.scope, nil
 	}
+	if s.inflight == nil {
+		s.inflight = make(map[string]*scopeCall)
+	}
+	c, shared := s.inflight[key]
+	if !shared {
+		c = s.startResolve(ctx, key, u)
+		s.inflight[key] = c
+	}
 	s.mu.Unlock()
 
-	scope, err := s.resolve(ctx, u)
-	if err != nil {
-		return nil, err
+	if shared {
+		span.SetAttributes(attribute.String("sse_proxy.rbac.cache", scopeCacheShared))
+		span.AddLink(trace.Link{SpanContext: c.span})
+	} else {
+		span.SetAttributes(attribute.String("sse_proxy.rbac.cache", scopeCacheMiss))
 	}
 
-	s.mu.Lock()
-	s.cache[key] = scopeEntry{scope: scope, expires: now.Add(s.ttl)}
-	s.mu.Unlock()
-	return scope, nil
+	select {
+	case <-c.done:
+		if c.err != nil {
+			return nil, c.err
+		}
+		return c.scope, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// startResolve starts the shared resolution for key and returns its call. It
+// is called with s.mu held; the resolution takes s.mu only once it is done.
+func (s *rbacScoper) startResolve(parent context.Context, key string, u jwtutil.UserInfo) *scopeCall {
+	timeout := s.resolveTimeout
+	if timeout <= 0 {
+		timeout = defaultScopeResolveTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
+	ctx, span := startSpan(ctx, "rbac.resolve")
+	c := &scopeCall{done: make(chan struct{}), span: span.SpanContext()}
+
+	go func() {
+		defer cancel()
+		started := time.Now()
+		scope, err := s.resolveRecovering(ctx, u)
+		if err == nil {
+			setScopeAttrs(span, scope)
+		}
+		endSpan(ctx, span, err)
+
+		s.mu.Lock()
+		if err == nil {
+			// The TTL counts from when the SARs were asked, not answered, so a
+			// slow resolution never extends how stale a scope can be.
+			s.cache[key] = scopeEntry{scope: scope, expires: started.Add(s.ttl)}
+		}
+		delete(s.inflight, key)
+		c.scope, c.err = scope, err
+		s.mu.Unlock()
+		close(c.done)
+	}()
+	return c
+}
+
+// resolveRecovering is resolve with a panic turned into an error. resolve runs
+// on its own goroutine now, out of reach of net/http's per-request recovery,
+// where a panic would end the process rather than one request. Fail closed
+// either way: an error yields no scope.
+func (s *rbacScoper) resolveRecovering(ctx context.Context, u jwtutil.UserInfo) (scope *nsScope, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			scope, err = nil, fmt.Errorf("rbac scope resolution panicked: %v", r)
+		}
+	}()
+	return s.resolve(ctx, u)
 }
 
 func (s *rbacScoper) resolve(ctx context.Context, u jwtutil.UserInfo) (*nsScope, error) {
@@ -494,6 +664,7 @@ func (s *rbacScoper) resolve(ctx context.Context, u jwtutil.UserInfo) (*nsScope,
 	if err != nil {
 		return nil, err
 	}
+	trace.SpanFromContext(ctx).SetAttributes(attribute.Int("sse_proxy.rbac.namespaces.checked", len(namespaces)))
 
 	var (
 		mu       sync.Mutex
@@ -528,6 +699,45 @@ func (s *rbacScoper) resolve(ctx context.Context, u jwtutil.UserInfo) (*nsScope,
 	}
 	sort.Strings(allowed)
 	return &nsScope{namespaces: allowed}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Spans. They take their tracer from the span already in ctx (the otelhttp
+// server span when tracing is on). With tracing off there is no span in ctx,
+// so these are no-ops, like the rest of the gated telemetry. NO span here may
+// carry the caller's identity (username, groups) or any token.
+// ---------------------------------------------------------------------------
+
+func startSpan(ctx context.Context, name string, opts ...trace.SpanStartOption) (context.Context, trace.Span) {
+	return trace.SpanFromContext(ctx).TracerProvider().Tracer(meterName).Start(ctx, name, opts...)
+}
+
+// endSpan ends span with err's status. A caller that went away (ctx
+// Canceled) is not a failure: the span stays Unset with
+// sse_proxy.caller_canceled=true, as the ClickHouse client span does
+// (clientspan.go). Our own deadline and real failures are Error.
+func endSpan(ctx context.Context, span trace.Span, err error) {
+	switch {
+	case err == nil:
+	case errors.Is(err, context.Canceled) && requestCanceled(ctx):
+		span.SetAttributes(callerCanceledAttr)
+	default:
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	span.End()
+}
+
+// setScopeAttrs describes a resolved scope by its shape only: allow-all, or
+// how many namespaces it allows. Never whose scope it is.
+func setScopeAttrs(span trace.Span, scope *nsScope) {
+	if scope == nil {
+		return
+	}
+	span.SetAttributes(
+		attribute.Bool("sse_proxy.rbac.allow_all", scope.allowAll),
+		attribute.Int("sse_proxy.rbac.namespaces.allowed", len(scope.namespaces)),
+	)
 }
 
 // logStatus prints the scoping posture at startup.

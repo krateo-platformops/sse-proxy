@@ -1,5 +1,5 @@
-# sse-proxy — LLM doc index (pinned: image 1.5.0, the release that bounds /events, adds the
-# per-event composition object, answers 499 to a caller that left and logs auth 503s).
+# sse-proxy — LLM doc index (pinned: image 1.5.1, the release that shares one RBAC scope
+# resolution per identity and gives /events and /audit one deadline covering scope + query).
 # One line per file; regenerate the pin on release (bare-semver tags only, no v prefix).
 # The deployed Helm chart is NOT in this repo: krateo-platformops/observability
 # charts/krateo-sse-proxy (the repo formerly named clickstack-chart).
@@ -18,7 +18,7 @@ examples/notifications-stream/job.yaml: the manifest — kubectl apply -f
 # Code-adjacent internals (authoritative): the package/file doc comments in the nine Go files.
 main.go: poller + hub + HTTP surface (pollSQL, topics, /events query building, SSE handler)
 auth.go: RS256/JWKS JWT validation against authn's public key (snowplow-identical, mandatory — fatal at startup if no JWKS source resolves), token acceptance order, context identity
-rbac.go: SubjectAccessReview-derived namespace scoping — fail-closed, cached, stdlib-only kube client
+rbac.go: SubjectAccessReview-derived namespace scoping — fail-closed, cached, one shared resolution per identity, traced, stdlib-only kube client
 telemetry.go: gated default-off OTel setup (OTEL_ENABLED master + per-signal overrides)
 metrics.go: the three sse_proxy_* instruments
 logging.go: always-on JSON slog with trace correlation

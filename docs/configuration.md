@@ -4,7 +4,7 @@ title: sse-proxy — configuration
 description: Every env var sse-proxy reads, with defaults and release-state caveats, and how the deployed chart in clickstack-chart wires them.
 resource: ghcr.io/krateo-platformops/sse-proxy
 tags: [configuration, env]
-timestamp: 2026-11-10T00:00:00Z
+timestamp: 2026-11-11T00:00:00Z
 ---
 
 # Configuration
@@ -20,10 +20,12 @@ Grouped by the file that reads them.
 | `CLICKHOUSE_USER` | `default` | ClickHouse basic-auth user |
 | `CLICKHOUSE_PASSWORD` | empty | ClickHouse basic-auth password (chart: from the `clickhouse-credentials` Secret, optional) |
 | `LISTEN_ADDR` | `:8080` | listen address |
-| `EVENTS_QUERY_TIMEOUT` | `4s` | deadline for one `/events` request's ClickHouse work, all windows together (Go duration). Keep it below the caller's upstream timeout (snowplow: 10 s), or the caller gives up first and the client gets a `5xx` instead of a partial answer |
+| `EVENTS_REQUEST_TIMEOUT` | `8s` | deadline for one whole `/events` request: RBAC scope resolution and all ClickHouse work together (Go duration). Keep it below the caller's upstream timeout (snowplow: 10 s). If it passes before the scope is resolved, the answer is `200` `[]` with `X-Events-Status: timeout`, never unscoped rows |
+| `EVENTS_QUERY_TIMEOUT` | `4s` | deadline for one `/events` request's ClickHouse work, all windows together (Go duration). It is a part of `EVENTS_REQUEST_TIMEOUT`, not added to it: when scope resolution was slow, the ClickHouse work is cut to end 100 ms before the request deadline, so the partial answer still arrives in time |
 | `EVENTS_DEFAULT_WINDOW` | `168h` | window of an `/events` request without `?window=` (Go duration; never above `EVENTS_MAX_WINDOW`). The default equals the max, so a request without `window` returns what it did before reads were bounded |
 | `EVENTS_MAX_WINDOW` | `168h` | widest window an `/events` request may ask for (Go duration). `168h` matches `otel_logs`' 7-day TTL |
-| `AUDIT_QUERY_TIMEOUT` | `8s` | deadline for one `/audit` request's ClickHouse query (Go duration). On the deadline `/audit` answers `500`, as for any ClickHouse failure; there is no partial answer. Keep it below the caller's upstream timeout |
+| `AUDIT_REQUEST_TIMEOUT` | `8s` | deadline for one whole `/audit` request: RBAC scope resolution and the query together (Go duration). On the deadline `/audit` answers `500`, wherever it passes. Keep it below the caller's upstream timeout |
+| `AUDIT_QUERY_TIMEOUT` | `8s` | deadline for one `/audit` request's ClickHouse query (Go duration), capped by what is left of `AUDIT_REQUEST_TIMEOUT`. On the deadline `/audit` answers `500`, as for any ClickHouse failure; there is no partial answer |
 
 Every ClickHouse query (`/events`, `/audit` and the poller) sets `readonly=2`,
 `cancel_http_readonly_queries_on_client_close=1` and, when it has a deadline (`/events`,
@@ -68,7 +70,7 @@ mandatory)`) rather than serving unauthenticated. For a local dev harness, point
 | `AUDIT_SCOPING_RESOURCE` | *(inherits `RBAC_SCOPING_RESOURCE`)* | the RBAC resource for `/audit` |
 | `AUDIT_SCOPING_APIGROUP` | *(inherits `RBAC_SCOPING_APIGROUP`)* | the RBAC apiGroup for `/audit` |
 | `RBAC_SCOPING_APIGROUP` | empty (core) | the RBAC apiGroup |
-| `RBAC_SCOPING_CACHE_TTL` | `60s` | per-(user, groups) scope cache TTL (Go duration) |
+| `RBAC_SCOPING_CACHE_TTL` | `60s` | per-(user, groups) scope cache TTL (Go duration). Concurrent misses for the same (user, groups) share one resolution, so a burst after an entry expires costs one SubjectAccessReview fan-out, not one per request |
 | `KUBERNETES_API_URL` | in-cluster | Kubernetes API endpoint override (tests / local runs; in-cluster uses the mounted ServiceAccount token + CA) |
 
 The ServiceAccount needs `create subjectaccessreviews.authorization.k8s.io` and

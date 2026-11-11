@@ -4,7 +4,7 @@ title: sse-proxy — overview
 description: How the SSE proxy works — the ClickHouse poller, the in-memory fan-out hub, topics, RS256/JWKS JWT auth, RBAC-derived tenant scoping, and gated OTel.
 resource: ghcr.io/krateo-platformops/sse-proxy
 tags: [architecture, sse, clickhouse, events]
-timestamp: 2026-11-10T00:00:00Z
+timestamp: 2026-11-11T00:00:00Z
 ---
 
 # Overview
@@ -111,7 +111,9 @@ boundary; the frontend is never trusted:
    enforced per-message at SSE fan-out. Empty set or any resolution error ⇒ no data.
 
 Scopes are cached per (user, groups) for `RBAC_SCOPING_CACHE_TTL` (default 60 s); an
-SSE connection keeps the scope resolved at connect time. Scoped callers never see
+SSE connection keeps the scope resolved at connect time. Concurrent misses for the same
+(user, groups) share one resolution, which runs detached from any single caller (bounded at
+30 s) and is cached only on success; each caller stops waiting when its own request does. Scoped callers never see
 cluster-scoped (namespace-less) events. The Kubernetes API is called with the pod's own
 ServiceAccount via a minimal stdlib client; it needs `create subjectaccessreviews` +
 `list namespaces` ([`deploy/deployment.yaml`](../deploy/deployment.yaml)).
@@ -122,7 +124,10 @@ All OTel is **gated, default-off** (`telemetry.go`): `OTEL_ENABLED` is the maste
 gate, `OTEL_TRACING_ENABLED` / `OTEL_METRICS_ENABLED` default to it and override it
 when set. When on: OTLP/HTTP export, `service.name=sse-proxy`, W3C trace propagation,
 `otelhttp` server spans on the mux (health filtered out) and client spans on the
-ClickHouse calls. Three metrics (`metrics.go`): `sse_proxy_connected_clients`,
+ClickHouse calls. Under the server span, scope resolution records `rbac.scope`
+(`sse_proxy.rbac.cache` = `hit`, `miss` or `shared`), `rbac.resolve`, and a client span per
+`kube.subject_access_review` and `kube.list_namespaces`, with counts and outcomes but never the
+caller's username, groups or a token. Three metrics (`metrics.go`): `sse_proxy_connected_clients`,
 `sse_proxy_events_delivered_total`, `sse_proxy_poll_errors_total`. Logging is always-on
 structured JSON slog with trace correlation when a span is active (`logging.go`).
 
