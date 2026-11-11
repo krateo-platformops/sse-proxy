@@ -78,14 +78,18 @@ jobs:
       #   observed healthy run   296   (go test -race -count=1 -v, 2026-11-10)
       #   floor                  250   catches losing any file contributing >46 RUN lines
       #
+      # Raised for 1.5.1 (one scope resolution per identity, end-to-end request deadlines):
+      #   observed healthy run   318   (go test -race -count=1 -v, 2026-11-11)
+      #   floor                  270   catches losing any file contributing >48 RUN lines
+      #
       # Raise it when the suite grows. A floor that never moves stops meaning anything, and
       # one derived from source rather than from a run is a guess wearing a calculation.
       - name: assert the suite actually ran tests
         run: |
           set -euo pipefail
           count=$(grep -c '^=== RUN' /tmp/go-test.log || true)
-          echo "test functions run: $count (observed healthy run: 296)"
-          if [ "$count" -lt 250 ]; then
-            echo "::error::only $count tests ran, floor is 250 — a suite that collects little or nothing passes vacuously (sse-proxy#28)"
+          echo "test functions run: $count (observed healthy run: 318)"
+          if [ "$count" -lt 270 ]; then
+            echo "::error::only $count tests ran, floor is 270 — a suite that collects little or nothing passes vacuously (sse-proxy#28)"
             exit 1
           fi

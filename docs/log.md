@@ -4,12 +4,42 @@ title: sse-proxy — log
 description: Curated chronological history — notable changes, decisions and incidents; release notes stay in GitHub Releases.
 resource: ghcr.io/krateo-platformops/sse-proxy
 tags: [history]
-timestamp: 2026-11-10T00:00:00Z
+timestamp: 2026-11-11T00:00:00Z
 ---
 
 # Log
 
 Curated history, newest first.
+
+## 2026-11-11 — 1.5.1: one scope resolution per identity, one deadline per request
+In a load test on krateo-057 (25 → 50 virtual users sharing 3 identities), 31 `/events` took
+11.8–12.8 s at the start of the step, past snowplow's 10 s, so they ended as 499s. ClickHouse
+was idle; in one trace the first ClickHouse query started 8.2 s after the request arrived. Two
+causes:
+
+- The scope cache had lapsed in an idle gap, and a miss had no single-flight: every request for
+  the same identity ran its own resolution (a cluster-wide SubjectAccessReview, a namespace list,
+  one SAR per namespace), about 16 identical fan-outs per identity at once.
+- The 4 s ClickHouse deadline started after scope resolution, so it was not end-to-end.
+
+Now concurrent misses for the same (user, groups) share one resolution. It runs detached from
+any one caller (so one caller leaving does not fail the others), bounded at 30 s, longer than
+any request so a slow apiserver still fills the cache for the next one. It is cached only on
+success, and each caller stops waiting when its own request does. `/events` has one deadline,
+`EVENTS_REQUEST_TIMEOUT` (8 s), covering scope resolution and ClickHouse. The ClickHouse budget
+is `EVENTS_QUERY_TIMEOUT` cut to end 100 ms before it. If the deadline passes before the scope
+is known, the answer is the existing "deadline before any window finished" one: `200` `[]` with
+`X-Events-Status: timeout`. It is never unscoped. `/audit` had the same shape and gets the
+same end-to-end deadline, `AUDIT_REQUEST_TIMEOUT` (8 s), where a deadline is still a `500`.
+
+Released together (1.5.1):
+
+- **Spans for scope resolution.** `rbac.scope` (with `sse_proxy.rbac.cache` = `hit`, `miss` or
+  `shared`), `rbac.resolve`, and client spans for each `kube.subject_access_review` and
+  `kube.list_namespaces`, under the `/events` server span. They carry namespace counts and SAR
+  outcomes, never the username, groups or a token.
+- **Kube API connection reuse.** The in-cluster client kept the default 2 idle connections per
+  host, so most of each 8-way SAR fan-out paid a new TLS handshake. It now keeps 8.
 
 ## 2026-11-10 — 1.5.0: /events is bounded, prunable, and answers before its caller gives up
 A load test on krateo-057 timed out nearly every `/events` read from about 70 req/s of portal

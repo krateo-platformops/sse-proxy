@@ -284,12 +284,15 @@ type config struct {
 
 	// /events read bounds. Zero means the built-in default (see the accessors),
 	// so a config{} literal in a test behaves like a deployment with no env set.
-	eventsTimeout   time.Duration
-	eventsWindowDef time.Duration
-	eventsWindowMax time.Duration
+	eventsTimeout    time.Duration
+	eventsReqTimeout time.Duration
+	eventsWindowDef  time.Duration
+	eventsWindowMax  time.Duration
 
 	// /audit query deadline. Zero means defaultAuditQueryTimeout.
 	auditTimeout time.Duration
+	// /audit end-to-end deadline. Zero means defaultAuditRequestTimeout.
+	auditReqTimeout time.Duration
 }
 
 func loadConfig() config {
@@ -299,9 +302,11 @@ func loadConfig() config {
 		clickhousePassword: getEnv("CLICKHOUSE_PASSWORD", ""),
 		listenAddr:         getEnv("LISTEN_ADDR", ":8080"),
 		eventsTimeout:      getEnvDuration("EVENTS_QUERY_TIMEOUT", defaultEventsQueryTimeout),
+		eventsReqTimeout:   getEnvDuration("EVENTS_REQUEST_TIMEOUT", defaultEventsRequestTimeout),
 		eventsWindowDef:    getEnvDuration("EVENTS_DEFAULT_WINDOW", defaultEventsWindow),
 		eventsWindowMax:    getEnvDuration("EVENTS_MAX_WINDOW", defaultEventsMaxWindow),
 		auditTimeout:       getEnvDuration("AUDIT_QUERY_TIMEOUT", defaultAuditQueryTimeout),
+		auditReqTimeout:    getEnvDuration("AUDIT_REQUEST_TIMEOUT", defaultAuditRequestTimeout),
 	}
 }
 
@@ -312,6 +317,38 @@ func (c config) auditQueryTimeout() time.Duration {
 		return c.auditTimeout
 	}
 	return defaultAuditQueryTimeout
+}
+
+// auditRequestTimeout bounds one /audit request end to end: scope resolution
+// and the query together.
+func (c config) auditRequestTimeout() time.Duration {
+	if c.auditReqTimeout > 0 {
+		return c.auditReqTimeout
+	}
+	return defaultAuditRequestTimeout
+}
+
+// eventsRequestTimeout bounds one /events request end to end: scope
+// resolution and every ClickHouse window together. It must stay below the
+// caller's upstream timeout (snowplow: 10s).
+func (c config) eventsRequestTimeout() time.Duration {
+	if c.eventsReqTimeout > 0 {
+		return c.eventsReqTimeout
+	}
+	return defaultEventsRequestTimeout
+}
+
+// eventsQueryBudget is the deadline for one /events request's ClickHouse work,
+// given the request's end-to-end deadline: EVENTS_QUERY_TIMEOUT from now, or
+// eventsAnswerMargin before the request deadline, whichever comes first. A
+// request whose scope resolution was slow therefore still answers (partially)
+// before its own deadline, instead of spending a full query budget on top.
+func (c config) eventsQueryBudget(now, requestDeadline time.Time) time.Time {
+	d := now.Add(c.eventsQueryTimeout())
+	if cut := requestDeadline.Add(-eventsAnswerMargin); cut.Before(d) {
+		return cut
+	}
+	return d
 }
 
 // eventsQueryTimeout bounds one /events request's ClickHouse work, all windows
@@ -870,6 +907,20 @@ const (
 	defaultEventsWindow       = 7 * 24 * time.Hour
 	defaultEventsMaxWindow    = 7 * 24 * time.Hour
 	defaultEventsQueryTimeout = 4 * time.Second
+	// defaultEventsRequestTimeout bounds one /events request end to end: RBAC
+	// scope resolution and every ClickHouse window together. The query budget
+	// above is a part of it, never added to it. It sits 2s below snowplow's 10s
+	// upstream timeout, so even a request whose scope resolution was slow
+	// answers before snowplow cuts it into a 499/5xx.
+	defaultEventsRequestTimeout = 8 * time.Second
+	// eventsAnswerMargin is held back from the ClickHouse budget when it is
+	// cut to the request deadline, so the partial answer is written before the
+	// deadline rather than at it.
+	eventsAnswerMargin = 100 * time.Millisecond
+	// defaultAuditRequestTimeout bounds one /audit request end to end, scope
+	// resolution included; the query deadline is the smaller of
+	// AUDIT_QUERY_TIMEOUT and what is left of this.
+	defaultAuditRequestTimeout = 8 * time.Second
 	// defaultAuditQueryTimeout bounds one /audit read. It is longer than the
 	// /events one because /audit has no partial answer to give: a deadline is
 	// a 500. krateo_audit is small (2,683 rows on krateo-057, 2026-11-10), so
@@ -1078,13 +1129,40 @@ func handleEvents(cfg config, client *http.Client, scoper *rbacScoper) http.Hand
 	// One throttle per handler: a saturated ClickHouse times out every request,
 	// and a line per request would bury the log at exactly the moment it is read.
 	timeoutLog := newLogThrottle(time.Minute)
+	scopeTimeoutLog := newLogThrottle(time.Minute)
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
-		scope, err := resolveRequestScope(r, scoper)
+		// ONE DEADLINE FOR THE WHOLE REQUEST. Until 1.5.1 the query deadline
+		// started after scope resolution, so a slow resolution plus a full query
+		// budget overran snowplow's 10s: on krateo-057 (2026-11-11) a request's
+		// first ClickHouse POST started 8.2s after it arrived. Now resolution
+		// runs under the request deadline and the ClickHouse budget is cut to
+		// what is left of it (eventsQueryBudget).
+		rctx, rcancel := context.WithTimeout(ctx, cfg.eventsRequestTimeout())
+		defer rcancel()
+
+		scope, err := resolveRequestScope(r.WithContext(rctx), scoper)
 		if err != nil {
 			if callerGone(r) {
 				answerCallerGone(w, r, "events", err)
+				return
+			}
+			// Our own request deadline passed before the scope was known. That
+			// is the situation of the query deadline passing before any window
+			// finished, and it gets that answer: 200, an empty array,
+			// X-Events-Status: timeout. Empty, never unscoped: no ClickHouse
+			// query runs without a resolved scope. A resolution that FAILED (the
+			// apiserver refused or erred) is still a 500 below.
+			if errors.Is(err, context.DeadlineExceeded) && errors.Is(rctx.Err(), context.DeadlineExceeded) {
+				if ok, suppressed := scopeTimeoutLog.allow(time.Now()); ok {
+					slogWarnCtx(ctx, "events", "rbac scope resolution hit the request deadline; answered timeout with no rows",
+						slog.Duration("request_timeout", cfg.eventsRequestTimeout()),
+						slog.Int64("suppressed_since_last_log", suppressed),
+					)
+				}
+				setEventsHeaders(w, eventsStatusTimeout, 0)
+				fmt.Fprint(w, "[]")
 				return
 			}
 			// Fail closed: no scope ⇒ no data.
@@ -1118,8 +1196,11 @@ func handleEvents(cfg config, client *http.Client, scoper *rbacScoper) http.Hand
 		// The deadline covers every window together and sits below the caller's
 		// own upstream timeout, so a slow read answers (partially) instead of
 		// being cut off by the caller into a 5xx. queryClickHouse turns it into
-		// ClickHouse's max_execution_time, so ClickHouse stops working too.
-		qctx, cancel := context.WithTimeout(ctx, cfg.eventsQueryTimeout())
+		// ClickHouse's max_execution_time, so ClickHouse stops working too. It
+		// is EVENTS_QUERY_TIMEOUT, cut to end eventsAnswerMargin before the
+		// request deadline when scope resolution has used part of that.
+		reqDeadline, _ := rctx.Deadline()
+		qctx, cancel := context.WithDeadline(rctx, cfg.eventsQueryBudget(time.Now(), reqDeadline))
 		defer cancel()
 		res, err := queryEventsWindowed(qctx, client, cfg, r.URL.Query(), scope, now, window)
 		if err != nil {

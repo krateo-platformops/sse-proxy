@@ -19,6 +19,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ---------------------------------------------------------------------------
@@ -90,7 +91,14 @@ func tracedServe(t *testing.T, h http.Handler, r *http.Request) (*httptest.Respo
 	defer func() { _ = tp.Shutdown(context.Background()) }()
 	rec := httptest.NewRecorder()
 	otelhttp.NewHandler(h, "sse-proxy", otelhttp.WithTracerProvider(tp)).ServeHTTP(rec, r)
-	spans := sr.Ended()
+	// Only the server span: a scoped request also records rbac.scope (and,
+	// on a miss, the kube spans) beneath it.
+	var spans []sdktrace.ReadOnlySpan
+	for _, s := range sr.Ended() {
+		if s.SpanKind() == trace.SpanKindServer {
+			spans = append(spans, s)
+		}
+	}
 	if len(spans) != 1 {
 		t.Fatalf("want 1 server span, got %d", len(spans))
 	}
@@ -217,6 +225,9 @@ func TestHandleEvents_CallerCancelDuringScopeResolutionIs499(t *testing.T) {
 	slowKube := slowServer()
 	defer slowKube.Close()
 	scoper := newTestScoper(slowKube, time.Minute)
+	// The shared resolution outlives the caller by design (scopeFor); bound it
+	// so slowKube.Close does not wait out the stub's 5s.
+	scoper.resolveTimeout = 300 * time.Millisecond
 
 	r := requestCanceledAfter(t, "/events", 100*time.Millisecond)
 	r = r.WithContext(withUserInfo(r.Context(), jwtutil.UserInfo{Username: "bob"}))

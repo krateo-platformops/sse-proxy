@@ -204,7 +204,14 @@ func handleAudit(cfg config, client *http.Client, scoper *rbacScoper) http.Handl
 			return
 		}
 
-		scope, err := resolveRequestScope(r, scoper)
+		// One deadline for the whole request, scope resolution included, as
+		// for /events: a slow resolution must not get a full query budget on
+		// top of it. A deadline passing during resolution is a 500, like a
+		// deadline during the query, since /audit has no partial answer.
+		rctx, rcancel := context.WithTimeout(ctx, cfg.auditRequestTimeout())
+		defer rcancel()
+
+		scope, err := resolveRequestScope(r.WithContext(rctx), scoper)
 		if err != nil {
 			if callerGone(r) {
 				answerCallerGone(w, r, "audit", err)
@@ -237,8 +244,10 @@ func handleAudit(cfg config, client *http.Client, scoper *rbacScoper) http.Handl
 		// postClickHouse turns it into ClickHouse's max_execution_time, so
 		// ClickHouse stops when this handler stops waiting. Unlike /events
 		// there is no narrower answer to fall back to, so a deadline is
-		// still a 500, as any failure was before.
-		qctx, cancel := context.WithTimeout(ctx, cfg.auditQueryTimeout())
+		// still a 500, as any failure was before. Derived from the request
+		// deadline, so it is AUDIT_QUERY_TIMEOUT or what is left of
+		// AUDIT_REQUEST_TIMEOUT, whichever ends first.
+		qctx, cancel := context.WithTimeout(rctx, cfg.auditQueryTimeout())
 		defer cancel()
 		rows, err := queryAuditRecords(qctx, client, cfg, query, params)
 		if err != nil {
