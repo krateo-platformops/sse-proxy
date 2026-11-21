@@ -59,7 +59,7 @@ mandatory)`) rather than serving unauthenticated. For a local dev harness, point
 | `JWT_JWKS_REQUEST_TIMEOUT` | `5s` | timeout for a single JWKS fetch (Go duration) |
 | `REFRESH_SESSION_COOKIE` | `krateo-session` | cookie name every authenticated path reads the token from (snowplow's convention) |
 
-## RBAC scoping (`rbac.go`) — opt-in, **unreleased** (on `main`, not in image `1.1.2`; see [release](./release.md))
+## RBAC scoping (`rbac.go`) — opt-in, off by default
 
 | Var | Default | Purpose |
 |---|---|---|
@@ -70,7 +70,7 @@ mandatory)`) rather than serving unauthenticated. For a local dev harness, point
 | `AUDIT_SCOPING_RESOURCE` | *(inherits `RBAC_SCOPING_RESOURCE`)* | the RBAC resource for `/audit` |
 | `AUDIT_SCOPING_APIGROUP` | *(inherits `RBAC_SCOPING_APIGROUP`)* | the RBAC apiGroup for `/audit` |
 | `RBAC_SCOPING_APIGROUP` | empty (core) | the RBAC apiGroup |
-| `RBAC_SCOPING_CACHE_TTL` | `60s` | per-(user, groups) scope cache TTL (Go duration). Concurrent misses for the same (user, groups) share one resolution, so a burst after an entry expires costs one SubjectAccessReview fan-out, not one per request |
+| `RBAC_SCOPING_CACHE_TTL` | `60s` | per-(user, groups) scope cache TTL (Go duration). Concurrent misses for the same (user, groups) share one resolution, so a burst after an entry expires costs one SubjectAccessReview fan-out, not one per request. Also how often an open `/notifications` stream re-resolves its scope (see [api](./api.md#how-long-a-stream-lasts)) |
 | `KUBERNETES_API_URL` | in-cluster | Kubernetes API endpoint override (tests / local runs; in-cluster uses the mounted ServiceAccount token + CA) |
 
 The ServiceAccount needs `create subjectaccessreviews.authorization.k8s.io` and

@@ -4,7 +4,7 @@ title: sse-proxy — API
 description: The HTTP/SSE contract — /events, /notifications, /health, the SSEK8sEvent payload, token acceptance and injection-safety guarantees.
 resource: ghcr.io/krateo-platformops/sse-proxy
 tags: [api, http, sse]
-timestamp: 2026-11-11T00:00:00Z
+timestamp: 2026-11-21T00:00:00Z
 ---
 
 # API
@@ -71,6 +71,9 @@ Also served at `/notifications/`. Response is `text/event-stream` with
 
 - `: connected` — an initial comment confirming the subscription;
 - `: keepalive` — a comment every 25 s;
+- `: token expired` — the last line of a stream whose token has expired, see below;
+- `: scope unavailable` — the last line of a stream whose RBAC scope could not be resolved
+  again, see below;
 - event frames:
 
   ```
@@ -88,7 +91,27 @@ Credentials, in order: `Authorization: Bearer` header, then the session cookie
 (`krateo-session`). A request with `access_token` or `token` in the query string gets 401
 even with valid credentials, because a URL reaches access logs and spans. CORS preflights
 are answered before authentication. Slow consumers drop messages (a buffer of one full poll, 500 messages) rather than stall the
-hub; with RBAC scoping on, the scope is fixed at connect time and enforced per message.
+hub.
+
+### How long a stream lasts
+
+A stream is authorized at connect, and the server keeps it within what that authorization
+allows while it is open:
+
+- **It ends when its token expires.** At the token's `exp` the server writes
+  `: token expired` and closes the stream, so a stream never outlives the token it was
+  opened with. A token without `exp` leaves the client to end the stream.
+- **With RBAC scoping on, its scope is re-resolved** every `RBAC_SCOPING_CACHE_TTL`
+  (60 s) and replaces the connect-time scope, checked when the hub queues a message and
+  again when the stream writes it. A namespace the caller has lost stops arriving within
+  at most twice the TTL, since a resolution may be served from a cache entry up to one TTL
+  old. If the scope cannot be resolved, the server writes `: scope unavailable` and closes
+  the stream: it fails closed, as at connect.
+
+Either way a client reconnects with a current token, which is validated and scoped again.
+The stream carries live events only and has no resume, so a client that must not miss
+events backfills the gap with `GET /events?window=<gap>` and de-duplicates by
+`metadata.uid`.
 
 ## `GET /health`
 
