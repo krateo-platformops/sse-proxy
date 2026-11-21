@@ -63,6 +63,22 @@ func userInfoFrom(ctx context.Context) (jwtutil.UserInfo, bool) {
 	return u, ok
 }
 
+type tokenExpiryCtxKey struct{}
+
+// withTokenExpiry returns a context carrying the verified token's expiry. The auth middleware sets
+// it next to the identity, from the same verified claims, so a request handler can stop serving a
+// caller whose token has run out: /notifications ends its stream then (see handleSSE).
+func withTokenExpiry(ctx context.Context, exp time.Time) context.Context {
+	return context.WithValue(ctx, tokenExpiryCtxKey{}, exp)
+}
+
+// tokenExpiryFrom returns the verified token's expiry. ok is false when the token carried no exp,
+// which plumbing accepts; such a stream is bounded only by the caller.
+func tokenExpiryFrom(ctx context.Context) (time.Time, bool) {
+	exp, ok := ctx.Value(tokenExpiryCtxKey{}).(time.Time)
+	return exp, ok
+}
+
 // authConfig holds the auth-related runtime configuration.
 type authConfig struct {
 	// keys resolves authn's RSA public keys (by "kid") from authn's JWKS
@@ -184,10 +200,10 @@ func (a authConfig) tokenFromRequestHeaderOrCookie(r *http.Request) (string, boo
 // The returned UserInfo carries the username + groups from the verified claims,
 // and kid is the "kid" the token asked the key source for ("" when the token
 // has none, or was refused before a key was looked up).
-func (a authConfig) validate(token string) (ui jwtutil.UserInfo, kid string, err error) {
+func (a authConfig) validate(token string) (claims jwtutil.KrateoClaims, kid string, err error) {
 	rec := &kidRecorder{inner: a.keys}
-	ui, err = jwtutil.ValidateWithKeySource(rec, token)
-	return ui, rec.kid, err
+	claims, err = jwtutil.ValidateClaimsWithKeySource(rec, token)
+	return claims, rec.kid, err
 }
 
 // kidRecorder passes key lookups through to the real key source and keeps the
@@ -333,14 +349,18 @@ func (a authConfig) requireBearer(next http.HandlerFunc) http.HandlerFunc {
 			_ = response.Unauthorized(w, fmt.Errorf("missing or malformed Authorization header, and no session cookie"))
 			return
 		}
-		ui, kid, err := a.validate(token)
+		claims, kid, err := a.validate(token)
 		if err != nil {
 			// 401 for a token fault, 503 for an unavailable key — both carry no
 			// token material.
 			a.writeAuthError(w, r, kid, err)
 			return
 		}
-		next(w, r.WithContext(withUserInfo(r.Context(), ui)))
+		ctx := withUserInfo(r.Context(), claims.UserInfo)
+		if claims.ExpiresAt != nil {
+			ctx = withTokenExpiry(ctx, claims.ExpiresAt.Time)
+		}
+		next(w, r.WithContext(ctx))
 	}
 }
 

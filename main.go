@@ -45,6 +45,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -182,15 +183,21 @@ type client struct {
 	// messages broadcast under that exact topic (server-side per-composition
 	// subscription).
 	topic string
-	// scope is the caller's RBAC-derived namespace scope, resolved at connect
-	// time (nil = scoping disabled). Enforced server-side on every message so
-	// a direct connection can never stream another tenant's events.
-	scope *nsScope
+	// scope is the caller's RBAC-derived namespace scope (nil = scoping
+	// disabled), resolved at connect time and re-resolved while the stream is
+	// open (see handleSSE), so a revoked namespace stops arriving within the
+	// scoper's cache TTL instead of at the next reconnect. Enforced server-side
+	// on every message so a direct connection can never stream another
+	// tenant's events. Atomic because the stream swaps it while the hub reads
+	// it under its own lock.
+	scope atomic.Pointer[nsScope]
 }
 
 // newClient is a subscriber with room for one full poll.
 func newClient(topic string, scope *nsScope) *client {
-	return &client{ch: make(chan sseMessage, clientBuffer), topic: topic, scope: scope}
+	c := &client{ch: make(chan sseMessage, clientBuffer), topic: topic}
+	c.scope.Store(scope)
+	return c
 }
 
 // wants reports whether this client should receive the message: the topic must
@@ -207,7 +214,7 @@ func (c *client) wants(msg sseMessage) bool {
 	if topic != msg.topic {
 		return false
 	}
-	return c.scope.allows(msg.namespace)
+	return c.scope.Load().allows(msg.namespace)
 }
 
 // globalTopic carries every event. A composition's events are also published on its own id.
@@ -1252,8 +1259,7 @@ func handleSSE(h *hub, scoper *rbacScoper) http.HandlerFunc {
 
 		// Resolve the caller's RBAC namespace scope BEFORE upgrading to a
 		// stream; fail closed when it cannot be established. The scope is
-		// fixed for the lifetime of the connection (RBAC changes apply on
-		// reconnect, within the scoper's cache TTL).
+		// re-resolved while the stream is open (rescope below).
 		scope, err := resolveRequestScope(r, scoper)
 		if err != nil {
 			slogErrorCtx(r.Context(), "sse", "rbac scope resolution failed", err)
@@ -1296,6 +1302,35 @@ func handleSSE(h *hub, scoper *rbacScoper) http.HandlerFunc {
 		keepalive := time.NewTicker(25 * time.Second)
 		defer keepalive.Stop()
 
+		// A stream is authorized once, at connect, but can stay open for hours (an agent that
+		// subscribes on a user's behalf never closes it). Two things bound it to what its caller
+		// may still see:
+		//
+		// expired: the stream ends when the token it was opened with expires, so it never outlives
+		// that token. The client reconnects with a fresh one, which is validated again. A token
+		// without exp (plumbing accepts it) leaves only the caller to end the stream.
+		var expired <-chan time.Time
+		if exp, ok := tokenExpiryFrom(r.Context()); ok {
+			t := time.NewTimer(time.Until(exp))
+			defer t.Stop()
+			expired = t.C
+		}
+		// rescope: with RBAC scoping on, the caller's scope is resolved again every cache TTL and
+		// replaces the connect-time one, so a namespace the caller lost stops arriving within at
+		// most twice the TTL (the scoper may serve a cache entry up to one TTL old), instead of at
+		// the next reconnect. A resolution that fails ends the stream: it fails closed, as at
+		// connect.
+		var rescope <-chan time.Time
+		if scoper != nil {
+			every := scoper.ttl
+			if every <= 0 { // loadRBACScoper refuses it; a scoper built elsewhere may not
+				every = defaultScopingCacheTTL
+			}
+			t := time.NewTicker(every)
+			defer t.Stop()
+			rescope = t.C
+		}
+
 		for {
 			select {
 			case <-r.Context().Done():
@@ -1304,9 +1339,30 @@ func handleSSE(h *hub, scoper *rbacScoper) http.HandlerFunc {
 				// SSE comment as a keepalive ping to prevent proxy timeouts.
 				fmt.Fprintf(w, ": keepalive\n\n")
 				flusher.Flush()
+			case <-expired:
+				// A comment, not a named event: every client already ignores comments, and the
+				// end of the stream is what makes a client reconnect.
+				slogInfoCtx(r.Context(), "sse", "stream ended: token expired")
+				fmt.Fprintf(w, ": token expired\n\n")
+				flusher.Flush()
+				return
+			case <-rescope:
+				s, err := resolveRequestScope(r, scoper)
+				if err != nil {
+					slogErrorCtx(r.Context(), "sse", "stream ended: rbac scope re-resolution failed", err)
+					fmt.Fprintf(w, ": scope unavailable\n\n")
+					flusher.Flush()
+					return
+				}
+				c.scope.Store(s)
 			case msg, ok := <-c.ch:
 				if !ok {
 					return
+				}
+				// The hub checked the scope when it queued the message; check it again here, so a
+				// message queued before the scope narrowed is not written after.
+				if !c.scope.Load().allows(msg.namespace) {
+					continue
 				}
 				fmt.Fprintf(w, "event: %s\ndata: %s\n\n", msg.topic, msg.data)
 				flusher.Flush()

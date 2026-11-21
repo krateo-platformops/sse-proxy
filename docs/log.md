@@ -4,12 +4,31 @@ title: sse-proxy — log
 description: Curated chronological history — notable changes, decisions and incidents; release notes stay in GitHub Releases.
 resource: ghcr.io/krateo-platformops/sse-proxy
 tags: [history]
-timestamp: 2026-11-11T00:00:00Z
+timestamp: 2026-11-21T00:00:00Z
 ---
 
 # Log
 
 Curated history, newest first.
+
+## 2026-11-21 — 1.6.0: a stream ends with its token and follows its caller's RBAC
+A `/notifications` stream was authorized once, at connect, and then kept that authorization for as
+long as it stayed open: past the token's expiry, and past a revoked namespace, until the client
+reconnected. A browser tab reconnects often enough for that not to matter; an agent that subscribes
+on a user's behalf keeps one stream open for hours.
+
+Now the stream ends at its token's `exp`, with a final `: token expired` comment, and with RBAC
+scoping on it re-resolves the caller's scope every `RBAC_SCOPING_CACHE_TTL` and applies it both when
+the hub queues a message and when the stream writes it. A revoked namespace stops arriving within at
+most twice the TTL. A scope that can no longer be resolved ends the stream with `: scope
+unavailable`, failing closed as at connect. Clients reconnect with a current token, as they already
+do for any closed stream.
+
+The expiry comes from plumbing's `ValidateClaimsWithKeySource` (plumbing v1.14.0 → v1.102.0), which
+verifies a token exactly as `ValidateWithKeySource` and also returns its registered claims, so the
+proxy does not parse the token a second time. `stream_lifetime_test.go` covers expiry through the
+real router, a live token's stream staying open, a revocation while open, a failing re-resolution,
+and a message queued before the scope narrowed.
 
 ## 2026-11-11 — 1.5.1: one scope resolution per identity, one deadline per request
 In a load test on krateo-057 (25 → 50 virtual users sharing 3 identities), 31 `/events` took

@@ -3,7 +3,7 @@ module github.com/krateo-platformops/sse-proxy
 go 1.26.10
 
 require (
-	github.com/krateo-platformops/plumbing v1.14.0
+	github.com/krateo-platformops/plumbing v1.102.0
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.47.0

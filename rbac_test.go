@@ -322,12 +322,12 @@ func TestClientWants_NamespaceScoping(t *testing.T) {
 		since string
 	}{
 		{"unscoped gets everything", &client{}, sseMessage{topic: "krateo", namespace: "team-b"}, true, ""},
-		{"allowAll gets everything", &client{scope: &nsScope{allowAll: true}}, sseMessage{topic: "krateo", namespace: "team-b"}, true, ""},
-		{"scoped gets own namespace", &client{scope: scoped}, sseMessage{topic: "krateo", namespace: "team-a"}, true, ""},
-		{"scoped denied other namespace", &client{scope: scoped}, sseMessage{topic: "krateo", namespace: "team-b"}, false, ""},
-		{"scoped denied cluster-scoped event", &client{scope: scoped}, sseMessage{topic: "krateo", namespace: ""}, false, ""},
-		{"scope applies on composition topic too", &client{topic: "comp-1", scope: scoped}, sseMessage{topic: "comp-1", namespace: "team-b"}, false, ""},
-		{"topic+scope both pass", &client{topic: "comp-1", scope: scoped}, sseMessage{topic: "comp-1", namespace: "team-a"}, true, ""},
+		{"allowAll gets everything", scopedClient("", 0, &nsScope{allowAll: true}), sseMessage{topic: "krateo", namespace: "team-b"}, true, ""},
+		{"scoped gets own namespace", scopedClient("", 0, scoped), sseMessage{topic: "krateo", namespace: "team-a"}, true, ""},
+		{"scoped denied other namespace", scopedClient("", 0, scoped), sseMessage{topic: "krateo", namespace: "team-b"}, false, ""},
+		{"scoped denied cluster-scoped event", scopedClient("", 0, scoped), sseMessage{topic: "krateo", namespace: ""}, false, ""},
+		{"scope applies on composition topic too", scopedClient("comp-1", 0, scoped), sseMessage{topic: "comp-1", namespace: "team-b"}, false, ""},
+		{"topic+scope both pass", scopedClient("comp-1", 0, scoped), sseMessage{topic: "comp-1", namespace: "team-a"}, true, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -340,9 +340,9 @@ func TestClientWants_NamespaceScoping(t *testing.T) {
 
 func TestHubBroadcastRespectsNamespaceScope(t *testing.T) {
 	h := newHub()
-	tenantA := &client{ch: make(chan sseMessage, 4), scope: &nsScope{namespaces: []string{"team-a"}}}
-	tenantB := &client{ch: make(chan sseMessage, 4), scope: &nsScope{namespaces: []string{"team-b"}}}
-	admin := &client{ch: make(chan sseMessage, 4), scope: &nsScope{allowAll: true}}
+	tenantA := scopedClient("", 4, &nsScope{namespaces: []string{"team-a"}})
+	tenantB := scopedClient("", 4, &nsScope{namespaces: []string{"team-b"}})
+	admin := scopedClient("", 4, &nsScope{allowAll: true})
 	h.register(tenantA)
 	h.register(tenantB)
 	h.register(admin)
@@ -441,4 +441,12 @@ func TestScopeHeaderEmptyIsDistinctFromAbsent(t *testing.T) {
 	if emptyV == absentV {
 		t.Errorf("empty and absent must differ, got both %q — they mean opposite things", emptyV)
 	}
+}
+
+// scopedClient builds a hub client with the given topic, channel capacity and scope, as newClient
+// does but with a chosen buffer, for tests that count what one broadcast delivered.
+func scopedClient(topic string, buf int, scope *nsScope) *client {
+	c := &client{ch: make(chan sseMessage, buf), topic: topic}
+	c.scope.Store(scope)
+	return c
 }
